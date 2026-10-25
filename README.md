@@ -5,8 +5,9 @@
 ## 项目状态
 
 首版（v1.0.0）已实现：三种阅读模式、手势与点击区、进度记忆、单话/多话/整部下载（一个 ZIP）。
-单元测试 113 项、Playwright e2e 8 项全部通过（Pixel 7 视口 + 触摸仿真，基于本地 harness 页）；
-**安卓真机清单（方案 §6.5）尚未执行**，交付验收前需在真机上逐项确认。
+单元测试 113 项、Playwright e2e 9 项全部通过（Pixel 7 视口 + 触摸仿真，基于本地 harness 页）；
+[samples/](samples/) 内含两个由真实下载流水线生成并经 PowerShell 独立解包核验的样本 ZIP（单话 + 跳选多话，跳选保持全局序号）。
+**安卓真机清单（方案 §6.5）尚未执行**，模板见 [docs/specs/device-checklist.md](docs/specs/device-checklist.md)，交付验收前需逐项确认。
 
 ## 安装
 

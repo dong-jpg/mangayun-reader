@@ -162,10 +162,25 @@ export class OverlayUI implements ReaderUI {
   // ---------- 工具栏 ----------
 
   #buildToolbar(): HTMLElement {
+    // R-C7：全屏 API 可用时提供全屏；不可用时提供沉浸模式，文案不混用
+    const fullscreenSupported =
+      typeof document.documentElement.requestFullscreen === 'function' && document.fullscreenEnabled
+    const screenBtn = h(
+      'button',
+      { class: 'myr-btn', type: 'button' },
+      fullscreenSupported ? '全屏' : '沉浸',
+    )
+    screenBtn.addEventListener('click', () => {
+      if (fullscreenSupported) this.#actions.toggleFullscreen()
+      else {
+        this.setToolbarVisible(false)
+        this.toast('沉浸模式：点击中央区域呼出菜单')
+      }
+    })
     const top = h('div', { class: 'myr-bar myr-bar-top' },
       h('button', { class: 'myr-btn', type: 'button', onclick: () => this.#actions.exit() }, '退出'),
       h('div', { class: 'myr-title' }, '增强阅读'),
-      h('button', { class: 'myr-btn', type: 'button', onclick: () => this.#actions.toggleFullscreen() }, '全屏'),
+      screenBtn,
       h('button', { class: 'myr-btn', type: 'button', onclick: () => this.#openSettings() }, '设置'),
     )
     const modeBtn = (kind: ReaderModeKind, label: string): HTMLButtonElement => {

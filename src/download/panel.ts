@@ -180,7 +180,28 @@ export class DownloadPanel {
       updateConfirm()
     }
     for (const b of Object.values(scopeBtns)) scopeRow.append(b)
-    box.append(scopeRow, list)
+    // R-D2：来源、存储方式与容量提示
+    const storageLine = el('div', 'myr-dl-status', '正在检测存储能力…')
+    void this.#deps.manager
+      .ensureCache()
+      .then(async (cache) => {
+        let quota = ''
+        try {
+          const est = await navigator.storage?.estimate?.()
+          if (est?.quota) quota += `，站点配额约 ${formatBytes(est.quota)}`
+        } catch {
+          /* estimate 不可用 */
+        }
+        const cap = cache.capBytes ? `（上限 ${Math.round(cache.capBytes / 1024 / 1024)} MiB）` : ''
+        const verified = this.#deps.adapter.supportOf(ref.siteId) === 'full'
+        storageLine.textContent =
+          `来源：${ref.siteId} · 存储：${cache.kind.toUpperCase()}${cap}，已用 ${formatBytes(cache.usedBytes())}${quota}` +
+          (verified ? '' : '（未验证来源，报告中会标注）')
+      })
+      .catch(() => {
+        storageLine.textContent = '存储能力检测失败，任务可能无法建立'
+      })
+    box.append(scopeRow, storageLine, list)
 
     const confirmBox = el('div', 'myr-dl-status')
     const actions = el('div', 'myr-sheet-actions')

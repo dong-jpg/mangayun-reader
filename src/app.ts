@@ -91,7 +91,13 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
     adapter: deps.adapter,
     settings: settingsStore,
     kv,
-    onProgress: (p) => panel.onProgress(p),
+    onProgress: (p) => {
+      panel.onProgress(p)
+      // R-C11：阅读和下载时请求 Wake Lock（可关闭，不支持时静默跳过）
+      if (p.state === 'downloading' || p.state === 'resolving' || p.state === 'packing') {
+        void controller.requestWakeLock()
+      }
+    },
     onPacked: (handle) => panel.onPacked(handle),
   })
   const panel = new DownloadPanel({

@@ -25,6 +25,7 @@ export const MOCK_CHAPTERS: Chapter[] = [
   { url: 'mock://ch/2', name: '第2话', order: 2, rawIndex: 1 },
   { url: 'mock://ch/3', name: '第3话', order: 3, rawIndex: 2 },
   { url: 'mock://ch/fault', name: '故障注入话', order: 4, rawIndex: 3 },
+  { url: 'mock://ch/long', name: '长章节60页', order: 5, rawIndex: 4 },
 ]
 
 /** 故障注入章节的页清单按解析版本变化：v1 含坏地址，v2+ 全部有效（模拟重新解析）。 */
@@ -93,6 +94,7 @@ export class MockAdapter implements SiteAdapter {
     if (chapterUrl === 'mock://ch/1') return this.#chapter1()
     if (chapterUrl === 'mock://ch/2') return this.#chapter2()
     if (chapterUrl === 'mock://ch/3') return this.#chapter3()
+    if (chapterUrl === 'mock://ch/long') return this.#chapterLong()
     if (chapterUrl === 'mock://ch/fault') return this.#chapterFault(count)
     throw new Error('未知章节')
   }
@@ -120,6 +122,13 @@ export class MockAdapter implements SiteAdapter {
     const images: string[] = []
     for (let i = 0; i < 6; i++) images.push(mockImg(`ch3-p${i}`, 600, 2400))
     return { chapterUrl: 'mock://ch/3', images, resolvedAt: Date.now() }
+  }
+
+  /** 长章节（60 页）：预加载窗口验收（R-C4）用。 */
+  #chapterLong(): PageList {
+    const images: string[] = []
+    for (let i = 0; i < 60; i++) images.push(mockImg(`long-p${i}`, 600, 900))
+    return { chapterUrl: 'mock://ch/long', images, resolvedAt: Date.now() }
   }
 
   /** 故障注入：v1 有 HTML 页与过期页（403），重解析（v2+）后全部有效（R-D13 路径）。 */

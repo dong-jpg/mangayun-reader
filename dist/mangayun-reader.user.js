@@ -2486,12 +2486,25 @@ ${comic.detailUrl}`)}`;
     }
     // ---------- 工具栏 ----------
     #buildToolbar() {
+      const fullscreenSupported = typeof document.documentElement.requestFullscreen === "function" && document.fullscreenEnabled;
+      const screenBtn = h(
+        "button",
+        { class: "myr-btn", type: "button" },
+        fullscreenSupported ? "全屏" : "沉浸"
+      );
+      screenBtn.addEventListener("click", () => {
+        if (fullscreenSupported) this.#actions.toggleFullscreen();
+        else {
+          this.setToolbarVisible(false);
+          this.toast("沉浸模式：点击中央区域呼出菜单");
+        }
+      });
       const top = h(
         "div",
         { class: "myr-bar myr-bar-top" },
         h("button", { class: "myr-btn", type: "button", onclick: () => this.#actions.exit() }, "退出"),
         h("div", { class: "myr-title" }, "增强阅读"),
-        h("button", { class: "myr-btn", type: "button", onclick: () => this.#actions.toggleFullscreen() }, "全屏"),
+        screenBtn,
         h("button", { class: "myr-btn", type: "button", onclick: () => this.#openSettings() }, "设置")
       );
       const modeBtn = (kind, label) => {
@@ -4528,7 +4541,21 @@ ${comic.detailUrl}`)}`;
         updateConfirm();
       };
       for (const b of Object.values(scopeBtns)) scopeRow.append(b);
-      box.append(scopeRow, list);
+      const storageLine = el("div", "myr-dl-status", "正在检测存储能力…");
+      void this.#deps.manager.ensureCache().then(async (cache) => {
+        let quota = "";
+        try {
+          const est = await navigator.storage?.estimate?.();
+          if (est?.quota) quota += `，站点配额约 ${formatBytes(est.quota)}`;
+        } catch {
+        }
+        const cap = cache.capBytes ? `（上限 ${Math.round(cache.capBytes / 1024 / 1024)} MiB）` : "";
+        const verified = this.#deps.adapter.supportOf(ref.siteId) === "full";
+        storageLine.textContent = `来源：${ref.siteId} · 存储：${cache.kind.toUpperCase()}${cap}，已用 ${formatBytes(cache.usedBytes())}${quota}` + (verified ? "" : "（未验证来源，报告中会标注）");
+      }).catch(() => {
+        storageLine.textContent = "存储能力检测失败，任务可能无法建立";
+      });
+      box.append(scopeRow, storageLine, list);
       const confirmBox = el("div", "myr-dl-status");
       const actions = el("div", "myr-sheet-actions");
       const startBtn = btn("确认下载", true, () => this.#start(ref, info, scope, selected, chapters));
@@ -4759,7 +4786,12 @@ ${comic.detailUrl}`)}`;
       adapter: deps.adapter,
       settings: settingsStore,
       kv,
-      onProgress: (p) => panel.onProgress(p),
+      onProgress: (p) => {
+        panel.onProgress(p);
+        if (p.state === "downloading" || p.state === "resolving" || p.state === "packing") {
+          void controller.requestWakeLock();
+        }
+      },
       onPacked: (handle) => panel.onPacked(handle)
     });
     const panel = new DownloadPanel({

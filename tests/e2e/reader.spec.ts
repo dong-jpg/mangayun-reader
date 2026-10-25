@@ -179,3 +179,44 @@ test('单页模式点击区按坐标生效（R-S2/T5）', async ({ page }) => {
   await page.mouse.click(center!.x + center!.width * 0.5, center!.y + center!.height * 0.5)
   await expect(page.locator('.myr-toolbar.myr-visible')).toBeVisible()
 })
+
+test('长章节预加载窗口：窗口外释放 src，返回已读页不重挂载（R-C4）', async ({ page }) => {
+  await page.goto(`/?ch=${encodeURIComponent('mock://ch/long')}`)
+  await waitForReader(page)
+  // 滑块跳到第 30 页
+  const center = await page.locator('.myr-mode-root').boundingBox()
+  await page.mouse.click(center!.x + center!.width / 2, center!.y + center!.height / 2)
+  await expect(page.locator('.myr-toolbar.myr-visible')).toBeVisible()
+  await page.locator('.myr-page-slider').evaluate((el: HTMLInputElement) => {
+    el.value = '30'
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await page.waitForTimeout(800)
+  const stats = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ui = (window as any).__harness.ui
+    return {
+      slots: ui.queryAll('.myr-page').length,
+      withSrc: ui.queryAll('.myr-page img[src]').length,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      page: (window as any).__harness.controller.pageStats.current,
+    }
+  })
+  expect(stats.slots).toBe(60)
+  // 窗口 = 当前页 -1 / +3（默认设置），验收允许 +2：不超过 6 个元素持有图片
+  expect(stats.withSrc).toBeLessThanOrEqual(6)
+  // 返回已读页面（第 5 页）：锚点恢复，不整章重挂载
+  await page.locator('.myr-page-slider').evaluate((el: HTMLInputElement) => {
+    el.value = '5'
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await page.waitForTimeout(600)
+  const back = await page.evaluate(() => ({
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    page: (window as any).__harness.controller.pageStats.current,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    withSrc: (window as any).__harness.ui.queryAll('.myr-page img[src]').length,
+  }))
+  expect(back.page).toBe(5)
+  expect(back.withSrc).toBeLessThanOrEqual(6)
+})

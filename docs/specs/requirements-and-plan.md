@@ -626,11 +626,18 @@ const MEMORY_MODE_CAP_MIB = 100;        // 固定值，不提供设置（§7 D7�
 ### 自动化测试结果
 
 - 单元测试：113 项通过（`npm test`），覆盖 §6.4 全部条目（url、chapters 快照、tap-zones 边界、gesture 状态机、naming、mime-sniff、crc32 标准向量、scheduler 并发/限流/取消/退避、progress 节流与淘汰、迁移导入导出、捕获层自包含性与包装行为、ZIP 读回校验）。
-- e2e：8 项通过（`npm run e2e`，Pixel 7 视口 + 触摸），基于 harness 页（mock 适配器 + 故障注入中间件）：三模式挂载/切换/退出无残留（含 20 次进出清理表不增长）、横竖屏锚点、RTL 第 1 页在最右、点击区坐标、404/429/HTML/过期重解析 → 未完成 → 部分导出（含报告与 ZIP 魔数校验）、刷新恢复不重复下载、暂停后无新请求。
-- `npm run typecheck`（strict）与 `npm run lint` 零告警；产物 `dist/mangayun-reader.user.js` 177KB（N-2 达标）。
+- e2e：9 项通过（`npm run e2e`，Pixel 7 视口 + 触摸），基于 harness 页（mock 适配器 + 故障注入中间件）：三模式挂载/切换/退出无残留（含 20 次进出清理表不增长）、横竖屏锚点、RTL 第 1 页在最右、点击区坐标、长章节预加载窗口（窗口外释放 src、返回不重挂载，R-C4）、404/429/HTML/过期重解析 → 未完成 → 部分导出（含报告与 ZIP 魔数校验）、刷新恢复不重复下载、暂停后无新请求。
+- `npm run typecheck`（strict）与 `npm run lint` 零告警；产物 `dist/mangayun-reader.user.js` 178KB（N-2 达标）。
+
+### 样本 ZIP（§6.1 交付物 4，harness 侧）
+
+`samples/sample-single-chapter.zip`（单话）与 `samples/sample-multi-skip.zip`（跳选第 1、3 话）由
+`npm run samples`（`scripts/make-samples.mjs`）驱动真实下载流水线生成；已用 PowerShell `Expand-Archive`
+独立解包核验：目录/编号与基线规格 §7 一致（跳选保持 `0001/0003` 全局序号）、PNG 头正确、
+`download-report.json` 与 §4.7 示例结构一致且未验证来源已标注。真机下载流程中的两枚样本仍需按 §6.1 在真机产生。
 
 ### 未完成（交付前必做）
 
-- §6.5 安卓真机清单 T1–T19 全部未测；桌面移动视口不能替代真机结果。
-- 样本 ZIP 两枚（单话 + 跳选多话）需在真机下载流程中产生并解包核对。
+- §6.5 安卓真机清单 T1–T19 全部未测（模板：`docs/specs/device-checklist.md`）；桌面移动视口不能替代真机结果。
+- 真机下载流程产生的两枚样本 ZIP 及解包核对。
 - 登录状态下隐藏 iframe 解析是否写阅读记录/书架进度（§3.3 待验证）未测。
