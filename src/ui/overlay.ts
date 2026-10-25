@@ -471,6 +471,7 @@ export class OverlayUI implements ReaderUI {
         h('div', { class: 'myr-sheet-body' },
           this.#settingsGroup('阅读宽度（纵向）', this.#widthControl(s)),
           this.#settingsGroup('横向适配', this.#horizontalFitControl(s)),
+          this.#settingsGroup('页间留隙', this.#gapToggle(s)),
           this.#settingsGroup('单页适应', this.#fitControl(s)),
           this.#settingsGroup('点击区', this.#tapZoneControl(s)),
           this.#settingsGroup('背景', this.#bgControl(s)),
@@ -565,12 +566,10 @@ export class OverlayUI implements ReaderUI {
       }, label)
       row.append(btn)
     }
-    const gapToggle = this.#gapToggle(s)
     return h('div', {},
       row,
       h('div', { class: 'myr-settings-label', style: 'font-size:11px;margin-top:4px' },
         '自动：竖屏整页可见、横屏按高度无缝'),
-      gapToggle,
     )
   }
 
@@ -580,8 +579,9 @@ export class OverlayUI implements ReaderUI {
     input.type = 'checkbox'
     input.checked = s.horizontalGap !== false
     input.addEventListener('change', () => this.#actions.setHorizontalGap(input.checked))
-    const label = h('label', { class: 'myr-toggle-row', style: 'margin-top:6px' },
-      h('span', { class: 'myr-settings-label', style: 'font-size:12px' }, '页间留隙（关闭后页面零间隙相接）'),
+    const label = h('label', { class: 'myr-toggle-row' },
+      h('span', { class: 'myr-settings-label' },
+        '保留页与页之间的空隙（日漫跨页拼接场景请关闭，页面零间隙相接）'),
       input)
     return label
   }
