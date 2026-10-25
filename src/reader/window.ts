@@ -33,6 +33,10 @@ export class PageWindow {
   #retryCount = new Map<number, number>()
   #failed = new Set<number>()
   #retryTimers = new Map<number, ReturnType<typeof setTimeout>>()
+  /** 已加载出真实比例的页；前几张一致时把占位比例统一为真实比例（消除加载完成时的尺寸跳变）。 */
+  #realRatios = new Set<number>()
+  #loadedRatios: number[] = []
+  #commonRatio: number | null = null
 
   constructor(pages: string[], config: PageWindowConfig, cb: PageWindowCallbacks = {}) {
     this.#pages = pages
@@ -61,6 +65,11 @@ export class PageWindow {
       this.slots[page]?.classList.remove('myr-page-error')
       if (img.naturalWidth > 0 && img.naturalHeight > 0) {
         const ratio = img.naturalWidth / img.naturalHeight
+        this.#realRatios.add(page)
+        if (this.#commonRatio == null) {
+          this.#loadedRatios.push(ratio)
+          this.#maybeAdoptCommonRatio()
+        }
         if (Math.abs(ratio - this.#ratios[page]!) > 0.001) {
           this.#ratios[page] = ratio
           this.slots[page]?.style.setProperty('aspect-ratio', `${ratio}`)
@@ -69,6 +78,23 @@ export class PageWindow {
       }
     })
     img.addEventListener('error', () => this.#onError(page))
+  }
+
+  /** 前 2 张已加载且比例一致（±5%）→ 未加载页的占位比例改为该值，减少加载后的布局跳变。 */
+  #maybeAdoptCommonRatio(): void {
+    const loaded = this.#loadedRatios
+    if (loaded.length < 2 || this.#commonRatio != null) return
+    const [a, b] = loaded
+    if (a == null || b == null) return
+    if (Math.abs(a - b) / Math.max(a, b) > 0.05) return
+    const common = (a + b) / 2
+    this.#commonRatio = common
+    for (const [i, slot] of this.slots.entries()) {
+      if (this.#realRatios.has(i)) continue
+      this.#ratios[i] = common
+      slot.style.setProperty('aspect-ratio', `${common}`)
+      this.#cb.onRatioChange?.(i, common)
+    }
   }
 
   #onError(page: number): void {

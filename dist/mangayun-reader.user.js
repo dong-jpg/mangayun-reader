@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaYun Reader
 // @namespace    https://github.com/dong-jpg/mangayun-reader
-// @version      1.0.1
+// @version      1.0.2
 // @author       dong-jpg
 // @description  云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）
 // @license      MIT
@@ -773,6 +773,7 @@
     direction: "rtl",
     verticalWidth: 100,
     horizontalFit: "auto",
+    horizontalGap: true,
     singleFit: "screen",
     tapZones: { top: "prev", left: "prev", bottom: "next", right: "next" },
     tapInContinuous: true,
@@ -1124,6 +1125,10 @@ ${comic.detailUrl}`)}`;
     #retryCount = /* @__PURE__ */ new Map();
     #failed = /* @__PURE__ */ new Set();
     #retryTimers = /* @__PURE__ */ new Map();
+    /** 已加载出真实比例的页；前几张一致时把占位比例统一为真实比例（消除加载完成时的尺寸跳变）。 */
+    #realRatios = /* @__PURE__ */ new Set();
+    #loadedRatios = [];
+    #commonRatio = null;
     constructor(pages, config, cb = {}) {
       this.#pages = pages;
       this.#config = config;
@@ -1150,6 +1155,11 @@ ${comic.detailUrl}`)}`;
         this.slots[page]?.classList.remove("myr-page-error");
         if (img.naturalWidth > 0 && img.naturalHeight > 0) {
           const ratio = img.naturalWidth / img.naturalHeight;
+          this.#realRatios.add(page);
+          if (this.#commonRatio == null) {
+            this.#loadedRatios.push(ratio);
+            this.#maybeAdoptCommonRatio();
+          }
           if (Math.abs(ratio - this.#ratios[page]) > 1e-3) {
             this.#ratios[page] = ratio;
             this.slots[page]?.style.setProperty("aspect-ratio", `${ratio}`);
@@ -1158,6 +1168,22 @@ ${comic.detailUrl}`)}`;
         }
       });
       img.addEventListener("error", () => this.#onError(page));
+    }
+    /** 前 2 张已加载且比例一致（±5%）→ 未加载页的占位比例改为该值，减少加载后的布局跳变。 */
+    #maybeAdoptCommonRatio() {
+      const loaded = this.#loadedRatios;
+      if (loaded.length < 2 || this.#commonRatio != null) return;
+      const [a, b] = loaded;
+      if (a == null || b == null) return;
+      if (Math.abs(a - b) / Math.max(a, b) > 0.05) return;
+      const common = (a + b) / 2;
+      this.#commonRatio = common;
+      for (const [i, slot] of this.slots.entries()) {
+        if (this.#realRatios.has(i)) continue;
+        this.#ratios[i] = common;
+        slot.style.setProperty("aspect-ratio", `${common}`);
+        this.#cb.onRatioChange?.(i, common);
+      }
     }
     #onError(page) {
       const attempts = this.#retryCount.get(page) ?? 0;
@@ -1358,7 +1384,14 @@ ${comic.detailUrl}`)}`;
           this.host.onAnchorChange(a);
         });
       });
+      let lastW = window.innerWidth;
+      let lastH = window.innerHeight;
       const onResize = () => {
+        const w = window.innerWidth;
+        const h2 = window.innerHeight;
+        if (Math.abs(w - lastW) < 1 && Math.abs(h2 - lastH) < 150) return;
+        lastW = w;
+        lastH = h2;
         this.onViewportChange();
         const a = this.#lastAnchor ?? this.getAnchor();
         this.goTo(a.page, a.offset);
@@ -1367,7 +1400,6 @@ ${comic.detailUrl}`)}`;
       this.cleanup.addListener(window, "resize", onResize);
       if (window.visualViewport) {
         this.cleanup.addListener(window.visualViewport, "resize", onResize);
-        this.cleanup.addListener(window.visualViewport, "scroll", onResize);
       }
       this.gesture = new GestureRecognizer({
         onTap: (x, y) => this.#handleTap(x, y)
@@ -1478,9 +1510,12 @@ ${comic.detailUrl}`)}`;
   }
   class HorizontalMode extends ContinuousMode {
     #fit = "height";
-    #gap = 12;
     constructor(host) {
       super({ axis: "x", host });
+    }
+    /** 页间空隙（适应屏幕适配）：设置“页间留隙”关闭后为 0（零间隙）。 */
+    #gap() {
+      return this.host.settings.horizontalGap === false ? 0 : 12;
     }
     /** 生效适配：auto = 竖屏 screen（整页可见），横屏 height（无缝连续）。 */
     #resolveFit() {
@@ -1494,6 +1529,8 @@ ${comic.detailUrl}`)}`;
       if (!this.scroller) return;
       this.#fit = this.#resolveFit();
       this.scroller.classList.toggle("myr-h-screen", this.#fit === "screen");
+      const gap = this.#gap();
+      this.scroller.style.setProperty("--myr-h-gap", `${gap}px`);
       const rect = this.scroller.getBoundingClientRect();
       for (const [i, slot] of this.win.slots.entries()) {
         if (this.#fit === "screen") {
@@ -1502,10 +1539,10 @@ ${comic.detailUrl}`)}`;
           let w;
           let h2;
           if (ratio >= viewRatio) {
-            w = rect.width - this.#gap;
+            w = rect.width - gap;
             h2 = w / ratio;
           } else {
-            h2 = rect.height - this.#gap;
+            h2 = rect.height - gap;
             w = h2 * ratio;
           }
           slot.style.width = `${Math.max(40, w)}px`;
@@ -2223,11 +2260,12 @@ ${comic.detailUrl}`)}`;
 .myr-strip-h > .myr-page { height: 100%; width: auto; flex: 0 0 auto }
 .myr-strip-h > .myr-page img { height: 100%; width: auto; display: block }
 
-/* 横向“适应屏幕”适配（竖屏手机）：整页可见、页间留隙、垂直居中 */
+/* 横向“适应屏幕”适配（竖屏手机）：整页可见、垂直居中；
+   页间空隙由 --myr-h-gap 控制（设置“页间留隙”可关为 0） */
 .myr-h-screen .myr-strip-h {
   align-items: center;
-  gap: 12px;
-  padding: 0 6px;
+  gap: var(--myr-h-gap, 12px);
+  padding: 0 calc(var(--myr-h-gap, 12px) / 2);
 }
 .myr-h-screen .myr-strip-h > .myr-page {
   height: auto; width: auto; /* 尺寸由脚本按比例设定 */
@@ -3008,6 +3046,7 @@ ${comic.detailUrl}`)}`;
         }, label);
         row.append(btn2);
       }
+      const gapToggle = this.#gapToggle(s);
       return h(
         "div",
         {},
@@ -3016,8 +3055,23 @@ ${comic.detailUrl}`)}`;
           "div",
           { class: "myr-settings-label", style: "font-size:11px;margin-top:4px" },
           "自动：竖屏整页可见、横屏按高度无缝"
-        )
+        ),
+        gapToggle
       );
+    }
+    /** 页间留隙开关（适应屏幕适配下 12px 空隙，可关为 0）。 */
+    #gapToggle(s) {
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = s.horizontalGap !== false;
+      input.addEventListener("change", () => this.#actions.setHorizontalGap(input.checked));
+      const label = h(
+        "label",
+        { class: "myr-toggle-row", style: "margin-top:6px" },
+        h("span", { class: "myr-settings-label", style: "font-size:12px" }, "页间留隙（关闭后页面零间隙相接）"),
+        input
+      );
+      return label;
     }
     #fitControl(s) {
       const fits = [["screen", "适应屏幕"], ["width", "适应宽度"], ["height", "适应高度"], ["original", "原始大小"]];
@@ -4842,6 +4896,10 @@ ${comic.detailUrl}`)}`;
       },
       setHorizontalFit: (fit) => {
         settingsStore.update({ horizontalFit: fit });
+        controller.applySettingChanges();
+      },
+      setHorizontalGap: (on) => {
+        settingsStore.update({ horizontalGap: on });
         controller.applySettingChanges();
       },
       setSingleFit: (fit) => {

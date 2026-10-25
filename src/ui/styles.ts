@@ -46,11 +46,12 @@ export const STYLES = `
 .myr-strip-h > .myr-page { height: 100%; width: auto; flex: 0 0 auto }
 .myr-strip-h > .myr-page img { height: 100%; width: auto; display: block }
 
-/* 横向“适应屏幕”适配（竖屏手机）：整页可见、页间留隙、垂直居中 */
+/* 横向“适应屏幕”适配（竖屏手机）：整页可见、垂直居中；
+   页间空隙由 --myr-h-gap 控制（设置“页间留隙”可关为 0） */
 .myr-h-screen .myr-strip-h {
   align-items: center;
-  gap: 12px;
-  padding: 0 6px;
+  gap: var(--myr-h-gap, 12px);
+  padding: 0 calc(var(--myr-h-gap, 12px) / 2);
 }
 .myr-h-screen .myr-strip-h > .myr-page {
   height: auto; width: auto; /* 尺寸由脚本按比例设定 */

@@ -89,9 +89,17 @@ export abstract class ContinuousMode implements ReaderMode {
       })
     })
 
-    // 尺寸变化（横竖屏、地址栏收展）→ 先让子类重算布局（如横向适配切换），
-    // 再按最近上报锚点恢复，不用变化后的几何重算（避免边界抖动导致滑页，R-C2）
+    // 尺寸变化 → 先让子类重算布局（如横向适配切换），再按最近上报锚点恢复。
+    // 守卫：安卓 Chrome 滑动时地址栏收展/双指缩放会触发 visualViewport 事件，
+    // 高度抖动 <150px 或纯缩放（innerWidth 不变）不重排，避免与手势打架造成闪跳。
+    let lastW = window.innerWidth
+    let lastH = window.innerHeight
     const onResize = () => {
+      const w = window.innerWidth
+      const h = window.innerHeight
+      if (Math.abs(w - lastW) < 1 && Math.abs(h - lastH) < 150) return
+      lastW = w
+      lastH = h
       this.onViewportChange()
       const a = this.#lastAnchor ?? this.getAnchor()
       this.goTo(a.page, a.offset)
@@ -100,7 +108,6 @@ export abstract class ContinuousMode implements ReaderMode {
     this.cleanup.addListener(window, 'resize', onResize)
     if (window.visualViewport) {
       this.cleanup.addListener(window.visualViewport, 'resize', onResize)
-      this.cleanup.addListener(window.visualViewport, 'scroll', onResize)
     }
 
     // 手势：点击区（可关闭）

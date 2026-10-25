@@ -14,10 +14,14 @@ import type { ModeHost } from '../mode-context'
 
 export class HorizontalMode extends ContinuousMode {
   #fit: 'height' | 'screen' = 'height'
-  #gap = 12
 
   constructor(host: ModeHost) {
     super({ axis: 'x', host })
+  }
+
+  /** 页间空隙（适应屏幕适配）：设置“页间留隙”关闭后为 0（零间隙）。 */
+  #gap(): number {
+    return this.host.settings.horizontalGap === false ? 0 : 12
   }
 
   /** 生效适配：auto = 竖屏 screen（整页可见），横屏 height（无缝连续）。 */
@@ -33,6 +37,8 @@ export class HorizontalMode extends ContinuousMode {
     if (!this.scroller) return
     this.#fit = this.#resolveFit()
     this.scroller.classList.toggle('myr-h-screen', this.#fit === 'screen')
+    const gap = this.#gap()
+    this.scroller.style.setProperty('--myr-h-gap', `${gap}px`)
     const rect = this.scroller.getBoundingClientRect()
     for (const [i, slot] of this.win.slots.entries()) {
       if (this.#fit === 'screen') {
@@ -41,10 +47,10 @@ export class HorizontalMode extends ContinuousMode {
         let w: number
         let h: number
         if (ratio >= viewRatio) {
-          w = rect.width - this.#gap
+          w = rect.width - gap
           h = w / ratio
         } else {
-          h = rect.height - this.#gap
+          h = rect.height - gap
           w = h * ratio
         }
         slot.style.width = `${Math.max(40, w)}px`

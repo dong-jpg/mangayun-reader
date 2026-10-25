@@ -14,6 +14,7 @@ export interface UIActions {
   switchDirection(direction: Direction, invertTapZones: boolean): void
   setVerticalWidth(width: number): void
   setHorizontalFit(fit: HorizontalFit): void
+  setHorizontalGap(on: boolean): void
   setSingleFit(fit: SingleFit): void
   setTapZones(zones: TapZones): void
   setBackground(bg: Background): void
@@ -564,11 +565,25 @@ export class OverlayUI implements ReaderUI {
       }, label)
       row.append(btn)
     }
+    const gapToggle = this.#gapToggle(s)
     return h('div', {},
       row,
       h('div', { class: 'myr-settings-label', style: 'font-size:11px;margin-top:4px' },
         '自动：竖屏整页可见、横屏按高度无缝'),
+      gapToggle,
     )
+  }
+
+  /** 页间留隙开关（适应屏幕适配下 12px 空隙，可关为 0）。 */
+  #gapToggle(s: Settings): HTMLElement {
+    const input = document.createElement('input')
+    input.type = 'checkbox'
+    input.checked = s.horizontalGap !== false
+    input.addEventListener('change', () => this.#actions.setHorizontalGap(input.checked))
+    const label = h('label', { class: 'myr-toggle-row', style: 'margin-top:6px' },
+      h('span', { class: 'myr-settings-label', style: 'font-size:12px' }, '页间留隙（关闭后页面零间隙相接）'),
+      input)
+    return label
   }
 
   #fitControl(s: Settings): HTMLElement {

@@ -264,3 +264,34 @@ test('横向适配：竖屏整页可见（自动=screen），切“适应高度�
   expect(heightFit.screen).toBe(false)
   expect(heightFit.ph).toBeGreaterThanOrEqual(heightFit.vh - 2)
 })
+
+test('页间留隙开关：关闭后横向“适应屏幕”页面零间隙相接', async ({ page }) => {
+  const center = await page.locator('.myr-mode-root').boundingBox()
+  await page.mouse.click(center!.x + center!.width / 2, center!.y + center!.height / 2)
+  await expect(page.locator('.myr-toolbar.myr-visible')).toBeVisible()
+  await page.locator('.myr-bar .myr-seg', { hasText: '横向' }).click()
+  await page.waitForTimeout(600)
+  const gapOf = () =>
+    page.evaluate(() => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ui = (window as any).__harness.ui
+      const slots = ui.queryAll('.myr-strip-h .myr-page') as HTMLElement[]
+      // LTR/RTL 通用：取相邻两页的间隙
+      const rects = slots.slice(0, 3).map((s) => s.getBoundingClientRect())
+      const gaps: number[] = []
+      const sorted = [...rects].sort((a, b) => a.left - b.left)
+      for (let i = 1; i < sorted.length; i++) gaps.push(Math.abs(sorted[i]!.left - sorted[i - 1]!.right))
+      return Math.min(...gaps)
+    })
+  // 默认留隙 ~12px
+  expect(await gapOf()).toBeGreaterThan(4)
+  // 关闭留隙
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const h = (window as any).__harness
+    h.app.settingsStore.update({ horizontalGap: false })
+    h.controller.applySettingChanges()
+  })
+  await page.waitForTimeout(500)
+  expect(await gapOf()).toBeLessThanOrEqual(1)
+})

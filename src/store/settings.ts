@@ -25,6 +25,8 @@ export interface Settings {
   direction: Direction
   verticalWidth: number // 50～100
   horizontalFit: HorizontalFit
+  /** 横向“适应屏幕”适配下页与页之间是否留 12px 空隙。 */
+  horizontalGap: boolean
   singleFit: SingleFit
   tapZones: TapZones
   tapInContinuous: boolean
@@ -43,6 +45,7 @@ export const DEFAULT_SETTINGS: Settings = {
   direction: 'rtl',
   verticalWidth: 100,
   horizontalFit: 'auto',
+  horizontalGap: true,
   singleFit: 'screen',
   tapZones: { top: 'prev', left: 'prev', bottom: 'next', right: 'next' },
   tapInContinuous: true,
