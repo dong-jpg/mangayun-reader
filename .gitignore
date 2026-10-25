@@ -1,0 +1,10 @@
+node_modules/
+.superpowers/
+coverage/
+test-results/
+playwright-report/
+*.log
+.site-probe/
+harness-dist/
+# M0：构建产物需要提交到 dist/，便于安卓用 raw 链接安装
+!dist/

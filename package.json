@@ -1,0 +1,34 @@
+{
+  "name": "mangayun-reader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "云漫（mangayun.com）增强阅读器油猴脚本：三种阅读模式、进度记忆与章节下载",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "build:harness": "vite build --config harness/vite.config.ts",
+    "preview:harness": "vite preview --config harness/vite.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "e2e": "playwright test",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.28.0",
+    "@playwright/test": "^1.53.0",
+    "@types/node": "^22.20.5",
+    "eslint": "^9.28.0",
+    "globals": "^16.5.0",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.33.0",
+    "vite": "^6.3.5",
+    "vite-plugin-monkey": "^5.0.8",
+    "vitest": "^3.1.4"
+  }
+}
