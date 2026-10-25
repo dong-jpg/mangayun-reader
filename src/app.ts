@@ -44,6 +44,10 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
       if (controller.comic) progress.setOverrides(controller.comic, { verticalWidth: width })
       controller.applySettingChanges()
     },
+    setHorizontalFit: (fit) => {
+      settingsStore.update({ horizontalFit: fit })
+      controller.applySettingChanges()
+    },
     setSingleFit: (fit) => {
       if (controller.comic) progress.setOverrides(controller.comic, { singleFit: fit })
       controller.applySettingChanges()

@@ -33,6 +33,12 @@ export abstract class ContinuousMode implements ReaderMode {
   /** 子类附加内容（宽度设置、方向、边缘卡片等）。 */
   protected abstract decorate(): void
 
+  /** 子类可在尺寸变化（横竖屏）时重算布局（如横向适配切换）。 */
+  protected onViewportChange(): void {}
+
+  /** 子类可在页面真实比例变化时重算布局。 */
+  protected onPageRatioChange(): void {}
+
   /** 页内容盒（含占位尺寸）的定位坐标。 */
   protected rectOf(el: HTMLElement): DOMRect {
     return el.getBoundingClientRect()
@@ -55,8 +61,13 @@ export abstract class ContinuousMode implements ReaderMode {
       this.host.pages,
       { before: s.preload.before, after: s.preload.after },
       {
-        onRatioChange: (page) => this.#compensateRatioChange(page),
-        onFatalError: () => this.#refreshErrorUI(),
+        onRatioChange: (page) => {
+          this.onPageRatioChange()
+          this.#compensateRatioChange(page)
+        },
+        onFatalError: () => {
+          /* 失败 UI 由 PageWindow 生成 */
+        },
         onReparseChapter: () => this.host.onReparseChapter(),
       },
     )
@@ -78,9 +89,10 @@ export abstract class ContinuousMode implements ReaderMode {
       })
     })
 
-    // 尺寸变化（横竖屏、地址栏收展）→ 按最近上报锚点恢复，
-    // 不用变化后的几何重算（避免边界抖动导致滑页，R-C2）
+    // 尺寸变化（横竖屏、地址栏收展）→ 先让子类重算布局（如横向适配切换），
+    // 再按最近上报锚点恢复，不用变化后的几何重算（避免边界抖动导致滑页，R-C2）
     const onResize = () => {
+      this.onViewportChange()
       const a = this.#lastAnchor ?? this.getAnchor()
       this.goTo(a.page, a.offset)
       this.#lastAnchor = a
@@ -115,7 +127,6 @@ export abstract class ContinuousMode implements ReaderMode {
     this.cleanup.addListener(this.scroller, 'click', stopper)
     this.cleanup.addListener(this.scroller, 'contextmenu', stopper)
 
-    this.#refreshErrorUI()
     // 首帧挂载后恢复锚点
     requestAnimationFrame(() => {
       this.goTo(anchor.page, anchor.offset)
@@ -200,13 +211,6 @@ export abstract class ContinuousMode implements ReaderMode {
     const r = slot.getBoundingClientRect()
     if (this.axis === 'y') return r.top + r.height * a.offset
     return r.left + r.width * a.offset
-  }
-
-  #refreshErrorUI(): void {
-    for (const [i, slot] of this.win.slots.entries()) {
-      const overlay = slot.querySelector<HTMLDivElement>('.myr-page-retry')
-      if (!this.win.imgs[i]?.getAttribute('src') && overlay) overlay.remove()
-    }
   }
 
   unmount(): void {

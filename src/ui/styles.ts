@@ -46,6 +46,20 @@ export const STYLES = `
 .myr-strip-h > .myr-page { height: 100%; width: auto; flex: 0 0 auto }
 .myr-strip-h > .myr-page img { height: 100%; width: auto; display: block }
 
+/* 横向“适应屏幕”适配（竖屏手机）：整页可见、页间留隙、垂直居中 */
+.myr-h-screen .myr-strip-h {
+  align-items: center;
+  gap: 12px;
+  padding: 0 6px;
+}
+.myr-h-screen .myr-strip-h > .myr-page {
+  height: auto; width: auto; /* 尺寸由脚本按比例设定 */
+}
+.myr-h-screen .myr-strip-h > .myr-page img {
+  height: 100%; width: 100%; object-fit: contain; display: block;
+}
+.myr-h-screen .myr-edge-card-h { height: auto; min-height: 40vh; align-self: center }
+
 .myr-page { position: relative; background: inherit }
 .myr-page img {
   display: block; width: 100%; height: 100%;

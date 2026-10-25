@@ -3,7 +3,7 @@
  * 工具栏默认收起（R-C9），底部面板操作，按钮 ≥48px，适配安全区。
  */
 import type { Chapter, ComicInfo } from '../site/types'
-import type { Background, Direction, ReaderModeKind, Settings, SingleFit, TapAction, TapZones } from '../store/settings'
+import type { Background, Direction, HorizontalFit, ReaderModeKind, Settings, SingleFit, TapAction, TapZones } from '../store/settings'
 import { TAP_PRESETS } from '../reader/tap-zones'
 import { Cleanup } from '../utils/cleanup'
 import { STYLES } from './styles'
@@ -13,6 +13,7 @@ export interface UIActions {
   switchMode(kind: ReaderModeKind): void
   switchDirection(direction: Direction, invertTapZones: boolean): void
   setVerticalWidth(width: number): void
+  setHorizontalFit(fit: HorizontalFit): void
   setSingleFit(fit: SingleFit): void
   setTapZones(zones: TapZones): void
   setBackground(bg: Background): void
@@ -468,6 +469,7 @@ export class OverlayUI implements ReaderUI {
         ),
         h('div', { class: 'myr-sheet-body' },
           this.#settingsGroup('阅读宽度（纵向）', this.#widthControl(s)),
+          this.#settingsGroup('横向适配', this.#horizontalFitControl(s)),
           this.#settingsGroup('单页适应', this.#fitControl(s)),
           this.#settingsGroup('点击区', this.#tapZoneControl(s)),
           this.#settingsGroup('背景', this.#bgControl(s)),
@@ -541,6 +543,32 @@ export class OverlayUI implements ReaderUI {
     })
     input.addEventListener('change', () => this.#actions.setVerticalWidth(Number(input.value)))
     return h('div', { class: 'myr-row' }, input, value)
+  }
+
+  /** 横向连续模式的页面适配（参考 Mihon Fit screen/height）。 */
+  #horizontalFitControl(s: Settings): HTMLElement {
+    const fits: [HorizontalFit, string][] = [
+      ['auto', '自动'],
+      ['height', '适应高度'],
+      ['screen', '适应屏幕'],
+    ]
+    const row = h('div', { class: 'myr-row' })
+    for (const [fit, label] of fits) {
+      const btn = h('button', {
+        class: `myr-btn myr-seg${s.horizontalFit === fit ? ' myr-seg-active' : ''}`, type: 'button',
+        onclick: () => {
+          this.#actions.setHorizontalFit(fit)
+          for (const b of row.querySelectorAll('.myr-seg')) b.classList.remove('myr-seg-active')
+          btn.classList.add('myr-seg-active')
+        },
+      }, label)
+      row.append(btn)
+    }
+    return h('div', {},
+      row,
+      h('div', { class: 'myr-settings-label', style: 'font-size:11px;margin-top:4px' },
+        '自动：竖屏整页可见、横屏按高度无缝'),
+    )
   }
 
   #fitControl(s: Settings): HTMLElement {

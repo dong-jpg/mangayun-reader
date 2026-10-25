@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaYun Reader
 // @namespace    https://github.com/dong-jpg/mangayun-reader
-// @version      1.0.0
+// @version      1.0.1
 // @author       dong-jpg
 // @description  云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）
 // @license      MIT
@@ -772,6 +772,7 @@
     mode: "vertical",
     direction: "rtl",
     verticalWidth: 100,
+    horizontalFit: "auto",
     singleFit: "screen",
     tapZones: { top: "prev", left: "prev", bottom: "next", right: "next" },
     tapInContinuous: true,
@@ -786,10 +787,12 @@
     return `myr:v1:comic:${fnv1aHex(`${comic.siteId}
 ${comic.detailUrl}`)}`;
   }
+  const HORIZONTAL_FITS = ["auto", "height", "screen"];
   function clampSettings(s) {
     return {
       ...s,
       verticalWidth: Math.min(100, Math.max(50, Math.round(s.verticalWidth))),
+      horizontalFit: HORIZONTAL_FITS.includes(s.horizontalFit) ? s.horizontalFit : "auto",
       preload: {
         before: Math.min(5, Math.max(0, Math.round(s.preload.before))),
         after: Math.min(10, Math.max(1, Math.round(s.preload.after)))
@@ -1307,6 +1310,12 @@ ${comic.detailUrl}`)}`;
       this.host = options.host;
       this.axis = options.axis;
     }
+    /** 子类可在尺寸变化（横竖屏）时重算布局（如横向适配切换）。 */
+    onViewportChange() {
+    }
+    /** 子类可在页面真实比例变化时重算布局。 */
+    onPageRatioChange() {
+    }
     /** 页内容盒（含占位尺寸）的定位坐标。 */
     rectOf(el2) {
       return el2.getBoundingClientRect();
@@ -1325,8 +1334,12 @@ ${comic.detailUrl}`)}`;
         this.host.pages,
         { before: s.preload.before, after: s.preload.after },
         {
-          onRatioChange: (page) => this.#compensateRatioChange(page),
-          onFatalError: () => this.#refreshErrorUI(),
+          onRatioChange: (page) => {
+            this.onPageRatioChange();
+            this.#compensateRatioChange(page);
+          },
+          onFatalError: () => {
+          },
           onReparseChapter: () => this.host.onReparseChapter()
         }
       );
@@ -1346,6 +1359,7 @@ ${comic.detailUrl}`)}`;
         });
       });
       const onResize = () => {
+        this.onViewportChange();
         const a = this.#lastAnchor ?? this.getAnchor();
         this.goTo(a.page, a.offset);
         this.#lastAnchor = a;
@@ -1376,7 +1390,6 @@ ${comic.detailUrl}`)}`;
       this.cleanup.addListener(this.scroller, "touchend", stopper, { passive: true });
       this.cleanup.addListener(this.scroller, "click", stopper);
       this.cleanup.addListener(this.scroller, "contextmenu", stopper);
-      this.#refreshErrorUI();
       requestAnimationFrame(() => {
         this.goTo(anchor.page, anchor.offset);
         this.win.update(anchor.page);
@@ -1450,12 +1463,6 @@ ${comic.detailUrl}`)}`;
       if (this.axis === "y") return r.top + r.height * a.offset;
       return r.left + r.width * a.offset;
     }
-    #refreshErrorUI() {
-      for (const [i, slot] of this.win.slots.entries()) {
-        const overlay = slot.querySelector(".myr-page-retry");
-        if (!this.win.imgs[i]?.getAttribute("src") && overlay) overlay.remove();
-      }
-    }
     unmount() {
       this.win?.unmount();
       this.gesture?.dispose();
@@ -1470,8 +1477,52 @@ ${comic.detailUrl}`)}`;
     e.stopPropagation();
   }
   class HorizontalMode extends ContinuousMode {
+    #fit = "height";
+    #gap = 12;
     constructor(host) {
       super({ axis: "x", host });
+    }
+    /** 生效适配：auto = 竖屏 screen（整页可见），横屏 height（无缝连续）。 */
+    #resolveFit() {
+      const setting = this.host.settings.horizontalFit ?? "auto";
+      if (setting === "height" || setting === "screen") return setting;
+      const rect = this.scroller.getBoundingClientRect();
+      return rect.height > rect.width ? "screen" : "height";
+    }
+    /** 按当前适配给页面定尺寸（screen 用包含式显式尺寸）。 */
+    #applyLayout() {
+      if (!this.scroller) return;
+      this.#fit = this.#resolveFit();
+      this.scroller.classList.toggle("myr-h-screen", this.#fit === "screen");
+      const rect = this.scroller.getBoundingClientRect();
+      for (const [i, slot] of this.win.slots.entries()) {
+        if (this.#fit === "screen") {
+          const ratio = this.win.ratioOf(i);
+          const viewRatio = rect.width / Math.max(1, rect.height);
+          let w;
+          let h2;
+          if (ratio >= viewRatio) {
+            w = rect.width - this.#gap;
+            h2 = w / ratio;
+          } else {
+            h2 = rect.height - this.#gap;
+            w = h2 * ratio;
+          }
+          slot.style.width = `${Math.max(40, w)}px`;
+          slot.style.height = `${Math.max(40, h2)}px`;
+        } else {
+          slot.style.width = "";
+          slot.style.height = "";
+        }
+      }
+    }
+    /** 基类在尺寸变化（横竖屏）时回调：先重算适配再恢复锚点。 */
+    onViewportChange() {
+      this.#applyLayout();
+    }
+    /** 页面真实比例已知/变化（占位 → 实测）：screen 适配需重定尺寸。 */
+    onPageRatioChange() {
+      this.#applyLayout();
     }
     decorate() {
       const start = this.makeEdgeCard("start", "上一话");
@@ -1512,6 +1563,8 @@ ${comic.detailUrl}`)}`;
       return { page, offset };
     }
     goTo(page, offset = 0) {
+      if (!this.scroller) return;
+      this.#applyLayout();
       const slot = this.win.slots[clamp$1(page, 0, this.win.slots.length - 1)];
       if (!slot) return;
       const scrollerRect = this.scroller.getBoundingClientRect();
@@ -2169,6 +2222,20 @@ ${comic.detailUrl}`)}`;
 .myr-rtl .myr-strip-h { flex-direction: row } /* direction:rtl 控制顺序 */
 .myr-strip-h > .myr-page { height: 100%; width: auto; flex: 0 0 auto }
 .myr-strip-h > .myr-page img { height: 100%; width: auto; display: block }
+
+/* 横向“适应屏幕”适配（竖屏手机）：整页可见、页间留隙、垂直居中 */
+.myr-h-screen .myr-strip-h {
+  align-items: center;
+  gap: 12px;
+  padding: 0 6px;
+}
+.myr-h-screen .myr-strip-h > .myr-page {
+  height: auto; width: auto; /* 尺寸由脚本按比例设定 */
+}
+.myr-h-screen .myr-strip-h > .myr-page img {
+  height: 100%; width: 100%; object-fit: contain; display: block;
+}
+.myr-h-screen .myr-edge-card-h { height: auto; min-height: 40vh; align-self: center }
 
 .myr-page { position: relative; background: inherit }
 .myr-page img {
@@ -2839,6 +2906,7 @@ ${comic.detailUrl}`)}`;
             "div",
             { class: "myr-sheet-body" },
             this.#settingsGroup("阅读宽度（纵向）", this.#widthControl(s)),
+            this.#settingsGroup("横向适配", this.#horizontalFitControl(s)),
             this.#settingsGroup("单页适应", this.#fitControl(s)),
             this.#settingsGroup("点击区", this.#tapZoneControl(s)),
             this.#settingsGroup("背景", this.#bgControl(s)),
@@ -2919,6 +2987,37 @@ ${comic.detailUrl}`)}`;
       });
       input.addEventListener("change", () => this.#actions.setVerticalWidth(Number(input.value)));
       return h("div", { class: "myr-row" }, input, value);
+    }
+    /** 横向连续模式的页面适配（参考 Mihon Fit screen/height）。 */
+    #horizontalFitControl(s) {
+      const fits = [
+        ["auto", "自动"],
+        ["height", "适应高度"],
+        ["screen", "适应屏幕"]
+      ];
+      const row = h("div", { class: "myr-row" });
+      for (const [fit, label] of fits) {
+        const btn2 = h("button", {
+          class: `myr-btn myr-seg${s.horizontalFit === fit ? " myr-seg-active" : ""}`,
+          type: "button",
+          onclick: () => {
+            this.#actions.setHorizontalFit(fit);
+            for (const b of row.querySelectorAll(".myr-seg")) b.classList.remove("myr-seg-active");
+            btn2.classList.add("myr-seg-active");
+          }
+        }, label);
+        row.append(btn2);
+      }
+      return h(
+        "div",
+        {},
+        row,
+        h(
+          "div",
+          { class: "myr-settings-label", style: "font-size:11px;margin-top:4px" },
+          "自动：竖屏整页可见、横屏按高度无缝"
+        )
+      );
     }
     #fitControl(s) {
       const fits = [["screen", "适应屏幕"], ["width", "适应宽度"], ["height", "适应高度"], ["original", "原始大小"]];
@@ -4739,6 +4838,10 @@ ${comic.detailUrl}`)}`;
       },
       setVerticalWidth: (width) => {
         if (controller.comic) progress.setOverrides(controller.comic, { verticalWidth: width });
+        controller.applySettingChanges();
+      },
+      setHorizontalFit: (fit) => {
+        settingsStore.update({ horizontalFit: fit });
         controller.applySettingChanges();
       },
       setSingleFit: (fit) => {

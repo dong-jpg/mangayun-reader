@@ -24,9 +24,12 @@ describe('settings（R-P3）', () => {
     const kv = memoryKV()
     const store = new SettingsStore(kv)
     expect(store.get()).toEqual(DEFAULT_SETTINGS)
-    const s = store.update({ verticalWidth: 300, download: { concurrency: 99 } })
+    expect(store.get().horizontalFit).toBe('auto')
+    const s = store.update({ verticalWidth: 300, download: { concurrency: 99 }, horizontalFit: 'bogus' as never })
     expect(s.verticalWidth).toBe(100)
     expect(s.download.concurrency).toBe(4)
+    expect(s.horizontalFit).toBe('auto')
+    expect(store.update({ horizontalFit: 'screen' }).horizontalFit).toBe('screen')
   })
 
   it('单部漫画覆盖项不影响其他漫画', () => {

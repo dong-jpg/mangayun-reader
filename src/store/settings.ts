@@ -6,6 +6,8 @@ import type { KV } from './kv'
 export type ReaderModeKind = 'horizontal' | 'vertical' | 'single'
 export type Direction = 'ltr' | 'rtl'
 export type SingleFit = 'screen' | 'width' | 'height' | 'original'
+/** 横向连续模式的页面适配（参考 Mihon Fit screen/height）。 */
+export type HorizontalFit = 'auto' | 'height' | 'screen'
 export type TapAction = 'prev' | 'next' | 'none'
 export type Background = 'black' | 'gray' | 'white' | 'system'
 
@@ -22,6 +24,7 @@ export interface Settings {
   mode: ReaderModeKind
   direction: Direction
   verticalWidth: number // 50～100
+  horizontalFit: HorizontalFit
   singleFit: SingleFit
   tapZones: TapZones
   tapInContinuous: boolean
@@ -39,6 +42,7 @@ export const DEFAULT_SETTINGS: Settings = {
   mode: 'vertical',
   direction: 'rtl',
   verticalWidth: 100,
+  horizontalFit: 'auto',
   singleFit: 'screen',
   tapZones: { top: 'prev', left: 'prev', bottom: 'next', right: 'next' },
   tapInContinuous: true,
@@ -68,10 +72,13 @@ export interface ComicRecord {
   }
 }
 
+const HORIZONTAL_FITS: HorizontalFit[] = ['auto', 'height', 'screen']
+
 export function clampSettings(s: Settings): Settings {
   return {
     ...s,
     verticalWidth: Math.min(100, Math.max(50, Math.round(s.verticalWidth))),
+    horizontalFit: HORIZONTAL_FITS.includes(s.horizontalFit) ? s.horizontalFit : 'auto',
     preload: {
       before: Math.min(5, Math.max(0, Math.round(s.preload.before))),
       after: Math.min(10, Math.max(1, Math.round(s.preload.after))),

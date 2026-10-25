@@ -220,3 +220,47 @@ test('长章节预加载窗口：窗口外释放 src，返回已读页不重挂�
   expect(back.page).toBe(5)
   expect(back.withSrc).toBeLessThanOrEqual(6)
 })
+
+test('横向适配：竖屏整页可见（自动=screen），切“适应高度”生效（Mihon 式适配）', async ({ page }) => {
+  const center = await page.locator('.myr-mode-root').boundingBox()
+  await page.mouse.click(center!.x + center!.width / 2, center!.y + center!.height / 2)
+  await expect(page.locator('.myr-toolbar.myr-visible')).toBeVisible()
+  await page.locator('.myr-bar .myr-seg', { hasText: '横向' }).click()
+  await page.waitForTimeout(600)
+  // 竖屏（默认 412×915）+ auto → screen：页面完整可见且页间有间隙
+  const screenFit = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ui = (window as any).__harness.ui
+    const scroller = ui.queryAll('.myr-scroll-h')[0] as HTMLElement
+    const s = scroller.getBoundingClientRect()
+    const slot = ui.queryAll('.myr-strip-h .myr-page')[0] as HTMLElement
+    const r = slot.getBoundingClientRect()
+    return { screen: scroller.classList.contains('myr-h-screen'), vw: s.width, vh: s.height, pw: r.width, ph: r.height }
+  })
+  expect(screenFit.screen).toBe(true)
+  expect(screenFit.pw).toBeLessThanOrEqual(screenFit.vw + 1)
+  expect(screenFit.ph).toBeLessThanOrEqual(screenFit.vh + 1)
+  expect(screenFit.pw).toBeGreaterThan(100)
+
+  // 切换到“适应高度”：页面铺满高度（无缝连续）
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const h = (window as any).__harness
+    h.app.settingsStore.update({ horizontalFit: 'height' })
+    h.controller.applySettingChanges()
+  })
+  await page.waitForTimeout(500)
+  const heightFit = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ui = (window as any).__harness.ui
+    const scroller = ui.queryAll('.myr-scroll-h')[0] as HTMLElement
+    const slot = ui.queryAll('.myr-strip-h .myr-page')[0] as HTMLElement
+    return {
+      screen: scroller.classList.contains('myr-h-screen'),
+      vh: scroller.getBoundingClientRect().height,
+      ph: slot.getBoundingClientRect().height,
+    }
+  })
+  expect(heightFit.screen).toBe(false)
+  expect(heightFit.ph).toBeGreaterThanOrEqual(heightFit.vh - 2)
+})
