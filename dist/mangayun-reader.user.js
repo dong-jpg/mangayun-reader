@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaYun Reader
 // @namespace    https://github.com/dong-jpg/mangayun-reader
-// @version      1.0.2
+// @version      1.0.3
 // @author       dong-jpg
 // @description  云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）
 // @license      MIT
@@ -1236,14 +1236,19 @@ ${comic.detailUrl}`)}`;
     setConfig(config) {
       this.#config = config;
     }
-    /** 窗口外的释放 src，保留占位尺寸。 */
-    update(current) {
+    /**
+     * 按锚点页与可见范围更新预加载窗口；窗口外的释放 src、保留占位尺寸。
+     * visible 为当前视口内实际可见的首页/末页（横屏一屏可见 3~4 页）：
+     * 窗口 = [min(可见首, 当前)-before, max(可见末, 当前)+after]，
+     * 可见页永不因参考线翻页被卸载（否则露出一角的页会闪白）。
+     */
+    update(current, visible) {
       const before = this.#config.before;
       const after = this.#config.after;
+      const lo = Math.min(visible ? visible.first : current, current) - before;
+      const hi = Math.max(visible ? visible.last : current, current) + after;
       const next = /* @__PURE__ */ new Set();
-      for (let i = current - before; i <= current + after; i++) {
-        if (i >= 0 && i < this.#pages.length) next.add(i);
-      }
+      for (let i = Math.max(0, lo); i <= Math.min(this.#pages.length - 1, hi); i++) next.add(i);
       for (const i of this.#inWindow) {
         if (!next.has(i) && !this.#failed.has(i)) this.#unload(i);
       }
@@ -1379,7 +1384,7 @@ ${comic.detailUrl}`)}`;
           rafPending = false;
           const a = this.computeAnchor();
           this.#lastAnchor = a;
-          this.win.update(a.page);
+          this.win.update(a.page, this.#visibleRange());
           this.host.onPageChange(a.page);
           this.host.onAnchorChange(a);
         });
@@ -1424,9 +1429,24 @@ ${comic.detailUrl}`)}`;
       this.cleanup.addListener(this.scroller, "contextmenu", stopper);
       requestAnimationFrame(() => {
         this.goTo(anchor.page, anchor.offset);
-        this.win.update(anchor.page);
+        this.win.update(anchor.page, this.#visibleRange());
         this.host.onPageChange(anchor.page);
       });
+    }
+    /** 视口内实际可见的首页/末页（横屏一屏 3~4 页时的卸载判定依据）。 */
+    #visibleRange() {
+      if (!this.scroller || this.win.slots.length === 0) return void 0;
+      const s = this.scroller.getBoundingClientRect();
+      let first = -1;
+      let last = -1;
+      for (const [i, slot] of this.win.slots.entries()) {
+        const r = slot.getBoundingClientRect();
+        if (r.right > s.left && r.left < s.right && r.bottom > s.top && r.top < s.bottom) {
+          if (first < 0) first = i;
+          last = i;
+        }
+      }
+      return first >= 0 ? { first, last } : void 0;
     }
     #handleTap(x, y) {
       if (this.host.settings.tapInContinuous !== true) {

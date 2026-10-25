@@ -74,7 +74,7 @@ export abstract class ContinuousMode implements ReaderMode {
     this.win.appendTo(this.content)
     this.decorate()
 
-    // 滚动 → 锚点 + 预加载
+    // 滚动 → 锚点 + 预加载（按真实可见范围，可见页永不卸载）
     let rafPending = false
     this.cleanup.addListener(this.scroller, 'scroll', () => {
       if (rafPending) return
@@ -83,7 +83,7 @@ export abstract class ContinuousMode implements ReaderMode {
         rafPending = false
         const a = this.computeAnchor()
         this.#lastAnchor = a
-        this.win.update(a.page)
+        this.win.update(a.page, this.#visibleRange())
         this.host.onPageChange(a.page)
         this.host.onAnchorChange(a)
       })
@@ -137,9 +137,26 @@ export abstract class ContinuousMode implements ReaderMode {
     // 首帧挂载后恢复锚点
     requestAnimationFrame(() => {
       this.goTo(anchor.page, anchor.offset)
-      this.win.update(anchor.page)
+      this.win.update(anchor.page, this.#visibleRange())
       this.host.onPageChange(anchor.page)
     })
+  }
+
+  /** 视口内实际可见的首页/末页（横屏一屏 3~4 页时的卸载判定依据）。 */
+  #visibleRange(): { first: number; last: number } | undefined {
+    if (!this.scroller || this.win.slots.length === 0) return undefined
+    const s = this.scroller.getBoundingClientRect()
+    let first = -1
+    let last = -1
+    for (const [i, slot] of this.win.slots.entries()) {
+      const r = slot.getBoundingClientRect()
+      // 两轴都相交才算可见（纵向模式所有页水平相交，必须同时判垂直）
+      if (r.right > s.left && r.left < s.right && r.bottom > s.top && r.top < s.bottom) {
+        if (first < 0) first = i
+        last = i
+      }
+    }
+    return first >= 0 ? { first, last } : undefined
   }
 
   #handleTap(x: number, y: number): void {

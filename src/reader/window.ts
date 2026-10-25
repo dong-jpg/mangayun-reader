@@ -153,14 +153,19 @@ export class PageWindow {
     this.#config = config
   }
 
-  /** 窗口外的释放 src，保留占位尺寸。 */
-  update(current: number): void {
+  /**
+   * 按锚点页与可见范围更新预加载窗口；窗口外的释放 src、保留占位尺寸。
+   * visible 为当前视口内实际可见的首页/末页（横屏一屏可见 3~4 页）：
+   * 窗口 = [min(可见首, 当前)-before, max(可见末, 当前)+after]，
+   * 可见页永不因参考线翻页被卸载（否则露出一角的页会闪白）。
+   */
+  update(current: number, visible?: { first: number; last: number }): void {
     const before = this.#config.before
     const after = this.#config.after
+    const lo = Math.min(visible ? visible.first : current, current) - before
+    const hi = Math.max(visible ? visible.last : current, current) + after
     const next = new Set<number>()
-    for (let i = current - before; i <= current + after; i++) {
-      if (i >= 0 && i < this.#pages.length) next.add(i)
-    }
+    for (let i = Math.max(0, lo); i <= Math.min(this.#pages.length - 1, hi); i++) next.add(i)
     for (const i of this.#inWindow) {
       if (!next.has(i) && !this.#failed.has(i)) this.#unload(i)
     }

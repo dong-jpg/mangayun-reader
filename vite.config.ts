@@ -8,7 +8,7 @@ export default defineConfig({
       userscript: {
         name: 'MangaYun Reader',
         namespace: 'https://github.com/dong-jpg/mangayun-reader',
-        version: '1.0.2',
+        version: '1.0.3',
         description: '云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）',
         author: 'dong-jpg',
         match: ['https://mangayun.com/*'],

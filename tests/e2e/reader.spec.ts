@@ -295,3 +295,63 @@ test('页间留隙开关：关闭后横向“适应屏幕”页面零间隙相�
   await page.waitForTimeout(500)
   expect(await gapOf()).toBeLessThanOrEqual(1)
 })
+
+test('横屏翻页闪白修复：参考线贴边界翻页时可见页不卸载 src', async ({ page }) => {
+  // 长章节 + 横屏 + 横向模式（适应高度，一屏约 3 页）
+  await page.goto(`/?ch=${encodeURIComponent('mock://ch/long')}`)
+  await page.locator('.myr-page img[src]').first().waitFor({ timeout: 15000 })
+  await page.waitForTimeout(300)
+  await page.setViewportSize({ width: 915, height: 412 })
+  const center = await page.locator('.myr-mode-root').boundingBox()
+  await page.mouse.click(center!.x + center!.width / 2, center!.y + center!.height / 2)
+  await expect(page.locator('.myr-toolbar.myr-visible')).toBeVisible()
+  await page.locator('.myr-bar .myr-seg', { hasText: '横向' }).click()
+  await page.waitForTimeout(600)
+  // 跳到长章节中部
+  await page.locator('.myr-page-slider').evaluate((el: HTMLInputElement) => {
+    el.value = '20'
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+  })
+  await page.waitForTimeout(700)
+
+  // 把参考线（视口中线）精确挪到第 21 页左缘内侧 5px——旧逻辑此时会卸载
+  // 仍部分可见的第 19 页（横屏一屏 3+ 页），露出白边
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ui = (window as any).__harness.ui
+    const scroller = ui.queryAll('.myr-scroll-h')[0] as HTMLElement
+    const slots = ui.queryAll('.myr-strip-h .myr-page') as HTMLElement[]
+    const s = scroller.getBoundingClientRect()
+    const target = slots[21]!.getBoundingClientRect()
+    // LTR：参考线需在 target.left + 5
+    const delta = target.left - (s.left + s.width / 2) + 5
+    scroller.scrollBy({ left: delta })
+  })
+  await page.waitForTimeout(400)
+
+  const check = await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ui = (window as any).__harness.ui
+    const scroller = ui.queryAll('.myr-scroll-h')[0] as HTMLElement
+    const slots = ui.queryAll('.myr-strip-h .myr-page') as HTMLElement[]
+    const s = scroller.getBoundingClientRect()
+    const visible: number[] = []
+    const missingSrc: number[] = []
+    for (const [i, slot] of slots.entries()) {
+      const r = slot.getBoundingClientRect()
+      if (r.right > s.left + 1 && r.left < s.right - 1) {
+        visible.push(i)
+        if (!slot.querySelector('img')?.getAttribute('src')) missingSrc.push(i)
+      }
+    }
+    return {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      current: (window as any).__harness.controller.pageStats.current,
+      visibleCount: visible.length,
+      visibleFirst: visible[0],
+      missingSrc,
+    }
+  })
+  expect(check.visibleCount).toBeGreaterThanOrEqual(2) // 横屏确实多页可见
+  expect(check.missingSrc).toEqual([]) // 所有可见页都有 src（不闪白）
+})
