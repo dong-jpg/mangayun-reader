@@ -9,7 +9,7 @@ import type {
 import { normalizeChapters } from './chapters'
 import { finalizeImageUrl, supportOf } from './images'
 import type { CaptureBus } from './capture'
-import { ChapterResolver } from './batch-resolver'
+import { ChapterResolver, scrapeReaderImages } from './batch-resolver'
 import { buildReadPath, parseReadPath, parseReadSearch } from './url'
 
 export function createMangayunAdapter(bus: CaptureBus): SiteAdapter {
@@ -60,6 +60,15 @@ export function createMangayunAdapter(bus: CaptureBus): SiteAdapter {
       return resolver.resolveComic(comic, seedChapterUrl)
     },
     async resolveChapter(comic, chapterUrl) {
+      // 顶层原站阅读器正在显示该章时直接抓取其 DOM（零网络、零延迟）；
+      // 章节不匹配或阅读器未渲染则走隐藏 iframe 流程
+      const route = readRouteOf(new URL(location.href))
+      if (route && route.chapterUrl === chapterUrl) {
+        const imgs = scrapeReaderImages(document)
+        if (imgs.length > 0) {
+          return { chapterUrl, images: imgs, resolvedAt: Date.now() }
+        }
+      }
       return resolver.resolveChapter(comic, chapterUrl)
     },
     supportOf,

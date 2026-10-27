@@ -73,11 +73,11 @@ describe('naming（R-D3、R-D4）', () => {
   it('章节文件夹与页文件名', () => {
     expect(chapterFolderName(2, '第2话')).toBe('0002_第2话')
     expect(chapterFolderName(0, '')).toBe('0000_unnamed')
-    expect(pageFileName(0, 'jpg')).toBe('0000.jpg')
+    expect(pageFileName(1, 'jpg')).toBe('0001.jpg')
     expect(pageFileName(12345, 'webp')).toBe('12345.webp')
   })
   it('部分导出后缀（R-D9）', () => {
-    expect(partialSuffix('comic.zip')).toBe('comic.zip_partial')
+    expect(partialSuffix('comic.zip')).toBe('comic_partial.zip')
   })
 })
 

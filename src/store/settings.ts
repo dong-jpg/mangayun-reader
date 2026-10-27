@@ -18,6 +18,13 @@ export interface TapZones {
   right: TapAction
 }
 
+export interface EntryPosition {
+  x: number
+  y: number
+  side?: 'left' | 'right'
+  yRatio?: number
+}
+
 export interface Settings {
   schema: number
   autoEnter: boolean
@@ -34,8 +41,8 @@ export interface Settings {
   background: Background
   keepAwake: boolean
   download: { concurrency: number } // 1～4
-  /** 悬浮入口位置（屏幕坐标 px）。 */
-  floatPos?: { x: number; y: number }
+  /** 保留旧版坐标，新增贴边与纵向比例以适应旋转后的视口。 */
+  floatPos?: EntryPosition
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -110,6 +117,11 @@ export class SettingsStore {
   }
 
   get(): Settings {
+    return this.#cache
+  }
+
+  reload(): Settings {
+    this.#cache = mergeSettings(this.#kv.get<unknown>(KEY_SETTINGS))
     return this.#cache
   }
 

@@ -6,6 +6,7 @@ import type { Chapter, ComicRef } from '../site/types'
 import { StoreZipWriter, type ZipSink } from '../utils/zip-store'
 import { chapterFolderName, comicRootName, pageFileName, partialSuffix } from '../utils/naming'
 import type { ImageCache } from './cache'
+import { version } from '../../package.json'
 
 export interface PackPage {
   /** 0 起页序。 */
@@ -74,7 +75,7 @@ export function buildReport(input: PackInput): DownloadReport {
   const complete = chapters.every((c) => c.missing.length === 0)
   return {
     tool: 'mangayun-reader',
-    version: '1.0.0',
+    version,
     createdAt: new Date().toISOString(),
     site: { siteId: input.ref.siteId, verified: input.siteVerified },
     comic: { title: input.title, detailUrl: input.ref.detailUrl },
@@ -100,22 +101,31 @@ export async function packToSink(
 ): Promise<PackResult> {
   const writer = new StoreZipWriter(sink)
   const root = comicRootName(input.title)
-  for (const [ci, c] of input.chapters.entries()) {
-    const folder = chapterFolderName(c.chapter.order, c.chapter.name)
-    for (const page of c.pages) {
-      if (page.ext == null) continue
-      const bytes = page.bytes ?? (await loadBytes(keyOf(ci, page.page)))
-      if (!bytes) continue
-      await writer.add(`${root}/${folder}/${pageFileName(page.page, page.ext)}`, bytes)
+  try {
+    for (const [ci, c] of input.chapters.entries()) {
+      const folder = chapterFolderName(c.chapter.order, c.chapter.name)
+      for (const page of c.pages) {
+        if (page.ext == null) continue
+        const bytes = page.bytes ?? (await loadBytes(keyOf(ci, page.page)))
+        if (!bytes) {
+          throw new Error(
+            `missing cached page ${c.chapter.name} page ${page.page + 1} (${keyOf(ci, page.page)})`,
+          )
+        }
+        await writer.add(`${root}/${folder}/${pageFileName(page.page + 1, page.ext)}`, bytes)
+      }
     }
+    const report = buildReport(input)
+    await writer.add(
+      `${root}/download-report.json`,
+      new TextEncoder().encode(JSON.stringify(report, null, 2)),
+    )
+    await writer.close()
+    return { byteLength: writer.byteLength, entryCount: writer.entryCount, report }
+  } catch (error) {
+    try { await sink.abort?.() } catch { /* Preserve the original packing failure. */ }
+    throw error
   }
-  const report = buildReport(input)
-  await writer.add(
-    `${root}/download-report.json`,
-    new TextEncoder().encode(JSON.stringify(report, null, 2)),
-  )
-  await writer.close()
-  return { byteLength: writer.byteLength, entryCount: writer.entryCount, report }
 }
 
 /** OPFS 输出文件 sink：流式写入，避免整包进内存。 */
@@ -126,6 +136,9 @@ export function opfsSink(writable: FileSystemWritableFileStream): ZipSink {
     },
     async close() {
       await writable.close()
+    },
+    async abort() {
+      await writable.abort()
     },
   }
 }
@@ -141,6 +154,11 @@ export class MemorySink implements ZipSink {
   }
 
   async close(): Promise<void> {}
+
+  async abort(): Promise<void> {
+    this.#chunks = []
+    this.#bytes = 0
+  }
 
   get byteLength(): number {
     return this.#bytes

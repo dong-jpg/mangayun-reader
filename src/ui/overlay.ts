@@ -3,10 +3,11 @@
  * 工具栏默认收起（R-C9），底部面板操作，按钮 ≥48px，适配安全区。
  */
 import type { Chapter, ComicInfo } from '../site/types'
-import type { Background, Direction, HorizontalFit, ReaderModeKind, Settings, SingleFit, TapAction, TapZones } from '../store/settings'
-import { TAP_PRESETS } from '../reader/tap-zones'
+import type { Background, Direction, HorizontalFit, ReaderModeKind, Settings, SingleFit, TapZones } from '../store/settings'
 import { Cleanup } from '../utils/cleanup'
 import { STYLES } from './styles'
+import { h } from './dom'
+import { createSettingsPanel } from './settings-panel'
 
 export interface UIActions {
   exit(): void
@@ -22,6 +23,8 @@ export interface UIActions {
   setKeepAwake(on: boolean): void
   setAutoEnter(on: boolean): void
   setTapInContinuous(on: boolean): void
+  setDownloadConcurrency(value: number): void
+  resetEntryPosition(): void
   jumpToPage(page: number): void
   jumpToChapter(chapter: Chapter): void
   neighborChapter(delta: 1 | -1): Chapter | null
@@ -47,6 +50,7 @@ export interface ReaderUI {
   toast(text: string): void
   /** 顶层面板（目录/设置）打开时返回 true（Esc 先关面板）。 */
   dismissTopPanel(): boolean
+  hasOpenPanel?(): boolean
 }
 
 const BG_COLOR: Record<Background, string> = {
@@ -54,30 +58,6 @@ const BG_COLOR: Record<Background, string> = {
   gray: '#3f3f46',
   white: '#fff',
   system: 'auto',
-}
-
-function h<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  attrs?: Record<string, string | number | boolean | ((e: Event) => void)>,
-  ...children: (Node | string | null | undefined)[]
-): HTMLElementTagNameMap[K] {
-  const el = document.createElement(tag)
-  if (attrs) {
-    for (const [key, value] of Object.entries(attrs)) {
-      if (key.startsWith('on') && typeof value === 'function') {
-        el.addEventListener(key.slice(2), value as EventListener)
-      } else if (typeof value === 'boolean') {
-        if (value) el.setAttribute(key, '')
-      } else {
-        el.setAttribute(key, String(value))
-      }
-    }
-  }
-  for (const child of children) {
-    if (child == null) continue
-    el.append(child instanceof Node ? child : document.createTextNode(child))
-  }
-  return el
 }
 
 export class OverlayUI implements ReaderUI {
@@ -122,7 +102,10 @@ export class OverlayUI implements ReaderUI {
 
     this.#root.append(this.#modeRootEl, this.#toolbar)
     this.#shadow.append(this.#root)
+  }
 
+  #bindEvents(): void {
+    this.#cleanup = new Cleanup()
     // 点击模式区以外不透传
     this.#cleanup.addListener(this.#root, 'pointerdown', (e) => e.stopPropagation())
     this.#cleanup.addListener(this.#root, 'touchstart', (e) => e.stopPropagation(), { passive: true })
@@ -130,6 +113,7 @@ export class OverlayUI implements ReaderUI {
     this.#cleanup.addListener(this.#root, 'touchend', (e) => e.stopPropagation(), { passive: true })
     this.#cleanup.addListener(this.#root, 'click', (e) => e.stopPropagation())
     this.#cleanup.addListener(this.#root, 'wheel', (e) => e.stopPropagation())
+    this.#cleanup.addListener(this.#root, 'keydown', (e) => e.stopPropagation())
   }
 
   get modeRoot(): HTMLElement {
@@ -142,7 +126,10 @@ export class OverlayUI implements ReaderUI {
   }
 
   open(): void {
-    if (!this.#host.isConnected) document.documentElement.appendChild(this.#host)
+    if (!this.#host.isConnected) {
+      document.documentElement.appendChild(this.#host)
+      this.#bindEvents()
+    }
     this.#root.classList.add('myr-open')
     this.setToolbarVisible(false)
     this.updatePageIndicator(1, 0)
@@ -183,7 +170,7 @@ export class OverlayUI implements ReaderUI {
       h('button', { class: 'myr-btn', type: 'button', onclick: () => this.#actions.exit() }, '退出'),
       h('div', { class: 'myr-title' }, '增强阅读'),
       screenBtn,
-      h('button', { class: 'myr-btn', type: 'button', onclick: () => this.#openSettings() }, '设置'),
+      h('button', { class: 'myr-btn', type: 'button', 'data-settings-trigger': '', onclick: () => this.#openSettings() }, '设置'),
     )
     const modeBtn = (kind: ReaderModeKind, label: string): HTMLButtonElement => {
       const btn = h('button', { class: 'myr-btn myr-seg', type: 'button', onclick: () => this.#actions.switchMode(kind) }, label)
@@ -351,8 +338,7 @@ export class OverlayUI implements ReaderUI {
       dismissed = true
     }
     if (this.#settingsSheet) {
-      this.#settingsSheet.remove()
-      this.#settingsSheet = null
+      this.#closeSettings()
       dismissed = true
     }
     if (this.#catalogSheet) {
@@ -366,6 +352,10 @@ export class OverlayUI implements ReaderUI {
       dismissed = true
     }
     return dismissed
+  }
+
+  hasOpenPanel(): boolean {
+    return this.#root.querySelector('.myr-sheet-wrap') !== null
   }
 
   /** 外部面板（如下载面板）挂载进 Shadow DOM（N-3 隔离）。 */
@@ -456,259 +446,20 @@ export class OverlayUI implements ReaderUI {
 
   // ---------- 设置 ----------
 
+  #closeSettings(): void {
+    this.#settingsSheet?.remove()
+    this.#settingsSheet = null
+    this.#toolbar.querySelector<HTMLButtonElement>('[data-settings-trigger]')?.focus({ preventScroll: true })
+  }
+
   #openSettings(): void {
     this.#settingsSheet?.remove()
-    const s = this.#actions.settings()
-    const sheet = h('div', { class: 'myr-sheet-wrap myr-sheet-bottom' },
-      h('div', { class: 'myr-sheet myr-sheet-tall myr-settings' },
-        h('div', { class: 'myr-sheet-head' },
-          h('div', { class: 'myr-sheet-title' }, '设置'),
-          h('button', {
-            class: 'myr-btn myr-btn-small', type: 'button',
-            onclick: () => { this.#settingsSheet?.remove(); this.#settingsSheet = null },
-          }, '关闭'),
-        ),
-        h('div', { class: 'myr-sheet-body' },
-          this.#settingsGroup('阅读宽度（纵向）', this.#widthControl(s)),
-          this.#settingsGroup('横向适配', this.#horizontalFitControl(s)),
-          this.#settingsGroup('页间留隙', this.#gapToggle(s)),
-          this.#settingsGroup('单页适应', this.#fitControl(s)),
-          this.#settingsGroup('点击区', this.#tapZoneControl(s)),
-          this.#settingsGroup('背景', this.#bgControl(s)),
-          this.#settingsGroup('预加载', this.#preloadControl(s)),
-          this.#toggleRow('屏幕常亮', s.keepAwake, (on) => this.#actions.setKeepAwake(on)),
-          this.#toggleRow('连续模式点击区', s.tapInContinuous, (on) => this.#actions.setTapInContinuous(on)),
-          this.#toggleRow('进入阅读页自动打开', s.autoEnter, (on) => this.#actions.setAutoEnter(on)),
-          this.#settingsGroup('设置导入导出', h('div', { class: 'myr-row' },
-            h('button', {
-              class: 'myr-btn myr-btn-small', type: 'button',
-              onclick: () => {
-                const blob = new Blob([this.#actions.exportSettings()], { type: 'application/json' })
-                const url = URL.createObjectURL(blob)
-                const a = document.createElement('a')
-                a.href = url
-                a.download = 'mangayun-reader-settings.json'
-                a.click()
-                URL.revokeObjectURL(url)
-              },
-            }, '导出'),
-            h('label', { class: 'myr-btn myr-btn-small myr-file-label' }, '导入',
-              (() => {
-                const input = document.createElement('input')
-                input.type = 'file'
-                input.accept = 'application/json'
-                input.addEventListener('change', async () => {
-                  const file = input.files?.[0]
-                  if (!file) return
-                  const text = await file.text()
-                  const result = this.#actions.importSettings(text)
-                  this.toast(result.ok ? '导入成功' : `导入失败：${result.error ?? '未知错误'}`)
-                  if (result.ok) {
-                    this.#settingsSheet?.remove()
-                    this.#settingsSheet = null
-                  }
-                })
-                return input
-              })(),
-            ),
-          )),
-        ),
-      ),
-    )
-    this.#settingsSheet = sheet
-    this.#root.append(sheet)
-  }
-
-  #settingsGroup(title: string, control: HTMLElement): HTMLElement {
-    return h('div', { class: 'myr-settings-group' }, h('div', { class: 'myr-settings-label' }, title), control)
-  }
-
-  #toggleRow(title: string, on: boolean, setter: (on: boolean) => void): HTMLElement {
-    const input = document.createElement('input')
-    input.type = 'checkbox'
-    input.checked = on
-    input.addEventListener('change', () => setter(input.checked))
-    return h('div', { class: 'myr-settings-group myr-toggle-row' },
-      h('div', { class: 'myr-settings-label' }, title), input)
-  }
-
-  #widthControl(s: Settings): HTMLElement {
-    const value = h('span', { class: 'myr-value' }, `${s.verticalWidth}%`)
-    const input = document.createElement('input')
-    input.type = 'range'
-    input.min = '50'
-    input.max = '100'
-    input.step = '5'
-    input.value = String(s.verticalWidth)
-    input.addEventListener('input', () => {
-      value.textContent = `${input.value}%`
+    this.#settingsSheet = createSettingsPanel({
+      actions: this.#actions,
+      onClose: () => this.#closeSettings(),
+      toast: (message) => this.toast(message),
     })
-    input.addEventListener('change', () => this.#actions.setVerticalWidth(Number(input.value)))
-    return h('div', { class: 'myr-row' }, input, value)
-  }
-
-  /** 横向连续模式的页面适配（参考 Mihon Fit screen/height）。 */
-  #horizontalFitControl(s: Settings): HTMLElement {
-    const fits: [HorizontalFit, string][] = [
-      ['auto', '自动'],
-      ['height', '适应高度'],
-      ['screen', '适应屏幕'],
-    ]
-    const row = h('div', { class: 'myr-row' })
-    for (const [fit, label] of fits) {
-      const btn = h('button', {
-        class: `myr-btn myr-seg${s.horizontalFit === fit ? ' myr-seg-active' : ''}`, type: 'button',
-        onclick: () => {
-          this.#actions.setHorizontalFit(fit)
-          for (const b of row.querySelectorAll('.myr-seg')) b.classList.remove('myr-seg-active')
-          btn.classList.add('myr-seg-active')
-        },
-      }, label)
-      row.append(btn)
-    }
-    return h('div', {},
-      row,
-      h('div', { class: 'myr-settings-label', style: 'font-size:11px;margin-top:4px' },
-        '自动：竖屏整页可见、横屏按高度无缝'),
-    )
-  }
-
-  /** 页间留隙开关（适应屏幕适配下 12px 空隙，可关为 0）。 */
-  #gapToggle(s: Settings): HTMLElement {
-    const input = document.createElement('input')
-    input.type = 'checkbox'
-    input.checked = s.horizontalGap !== false
-    input.addEventListener('change', () => this.#actions.setHorizontalGap(input.checked))
-    const label = h('label', { class: 'myr-toggle-row' },
-      h('span', { class: 'myr-settings-label' },
-        '保留页与页之间的空隙（日漫跨页拼接场景请关闭，页面零间隙相接）'),
-      input)
-    return label
-  }
-
-  #fitControl(s: Settings): HTMLElement {
-    const fits: [SingleFit, string][] = [['screen', '适应屏幕'], ['width', '适应宽度'], ['height', '适应高度'], ['original', '原始大小']]
-    const row = h('div', { class: 'myr-row' })
-    for (const [fit, label] of fits) {
-      const btn = h('button', {
-        class: `myr-btn myr-seg${s.singleFit === fit ? ' myr-seg-active' : ''}`, type: 'button',
-        onclick: () => {
-          this.#actions.setSingleFit(fit)
-          for (const b of row.querySelectorAll('.myr-seg')) b.classList.remove('myr-seg-active')
-          btn.classList.add('myr-seg-active')
-        },
-      }, label)
-      row.append(btn)
-    }
-    return row
-  }
-
-  #bgControl(s: Settings): HTMLElement {
-    const bgs: [Background, string][] = [['black', '黑'], ['gray', '深灰'], ['white', '白'], ['system', '跟随系统']]
-    const row = h('div', { class: 'myr-row' })
-    for (const [bg, label] of bgs) {
-      const btn = h('button', {
-        class: `myr-btn myr-seg${s.background === bg ? ' myr-seg-active' : ''}`, type: 'button',
-        onclick: () => {
-          this.#actions.setBackground(bg)
-          for (const b of row.querySelectorAll('.myr-seg')) b.classList.remove('myr-seg-active')
-          btn.classList.add('myr-seg-active')
-        },
-      }, label)
-      row.append(btn)
-    }
-    return row
-  }
-
-  #preloadControl(s: Settings): HTMLElement {
-    const before = h('span', { class: 'myr-value' }, String(s.preload.before))
-    const after = h('span', { class: 'myr-value' }, String(s.preload.after))
-    const mk = (label: string, current: number, min: number, max: number, span: HTMLElement, pick: (v: number) => void): HTMLElement =>
-      h('div', { class: 'myr-row' },
-        h('span', { class: 'myr-mini-label' }, label),
-        h('button', { class: 'myr-btn myr-btn-small', type: 'button', onclick: () => { const v = Math.max(min, current - 1); span.textContent = String(v); pick(v) } }, '−'),
-        span,
-        h('button', { class: 'myr-btn myr-btn-small', type: 'button', onclick: () => { const v = Math.min(max, current + 1); span.textContent = String(v); pick(v) } }, '+'),
-      )
-    const wrap = h('div', {},
-      mk('之前', s.preload.before, 0, 5, before, (v) => this.#actions.setPreload(v, Number(after.textContent))),
-      mk('之后', s.preload.after, 1, 10, after, (v) => this.#actions.setPreload(Number(before.textContent), v)),
-    )
-    return wrap
-  }
-
-  /** 点击区编辑：四区选择 + 示意图 + 预设 + 恢复默认（R-S2、R-S4、R-S5）。 */
-  #tapZoneControl(s: Settings): HTMLElement {
-    const zones = { ...s.tapZones }
-    const preview = h('div', { class: 'myr-zone-preview' })
-    const zoneNames: [keyof TapZones, string][] = [['top', '上'], ['left', '左'], ['right', '右'], ['bottom', '下']]
-    const actionLabel: Record<TapAction, string> = { prev: '上一页', next: '下一页', none: '无操作' }
-    const renderPreview = (): void => {
-      preview.textContent = ''
-      const mk = (cls: string, label: string): HTMLElement => h('div', { class: `myr-zone myr-zone-${cls}` }, label)
-      preview.append(
-        mk('top', actionLabel[zones.top]),
-        h('div', { class: 'myr-zone-mid' },
-          mk('left', actionLabel[zones.left]),
-          mk('center', '菜单'),
-          mk('right', actionLabel[zones.right]),
-        ),
-        mk('bottom', actionLabel[zones.bottom]),
-      )
-    }
-    const selects = h('div', { class: 'myr-row myr-wrap' })
-    for (const [zone, label] of zoneNames) {
-      const select = document.createElement('select')
-      select.className = 'myr-select'
-      for (const action of ['prev', 'next', 'none'] as TapAction[]) {
-        const opt = document.createElement('option')
-        opt.value = action
-        opt.textContent = `${label}：${actionLabel[action]}`
-        if (zones[zone] === action) opt.selected = true
-        select.append(opt)
-      }
-      select.addEventListener('change', () => {
-        zones[zone] = select.value as TapAction
-        renderPreview()
-        this.#actions.setTapZones({ ...zones })
-      })
-      selects.append(select)
-    }
-    const presetRow = h('div', { class: 'myr-row myr-wrap' })
-    for (const preset of Object.values(TAP_PRESETS)) {
-      presetRow.append(h('button', {
-        class: 'myr-btn myr-btn-small', type: 'button',
-        onclick: () => {
-          Object.assign(zones, preset.zones)
-          renderPreview()
-          this.#actions.setTapZones({ ...zones })
-          for (const select of selects.querySelectorAll('select')) {
-            const zone = select.dataset.zone as keyof TapZones | undefined
-            if (zone) select.value = zones[zone]
-          }
-        },
-      }, preset.label))
-    }
-    selects.querySelectorAll('select').forEach((sel, i) => {
-      sel.dataset.zone = zoneNames[i]![0]
-    })
-    renderPreview()
-    return h('div', {},
-      preview, selects, presetRow,
-      h('div', { class: 'myr-row' },
-        h('button', {
-          class: 'myr-btn myr-btn-small', type: 'button',
-          onclick: () => {
-            Object.assign(zones, TAP_PRESETS.default!.zones)
-            renderPreview()
-            this.#actions.setTapZones({ ...zones })
-          },
-        }, '恢复默认'),
-        h('button', {
-          class: 'myr-btn myr-btn-small', type: 'button',
-          onclick: () => { this.#settingsSheet?.remove(); this.#settingsSheet = null; this.toast('已应用，点击试用') },
-        }, '立即试用'),
-      ),
-    )
+    this.#root.append(this.#settingsSheet)
+    this.#settingsSheet.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true })
   }
 }

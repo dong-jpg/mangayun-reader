@@ -43,6 +43,18 @@ describe('settings（R-P3）', () => {
     store.update({ mode: 'single' })
     expect(store.effective(COMIC).mode).toBe('horizontal')
   })
+
+  it('reload refreshes a live store after settings are imported', () => {
+    const source = memoryKV()
+    new SettingsStore(source).update({ background: 'white', preload: { before: 4, after: 7 } })
+    const target = memoryKV()
+    const live = new SettingsStore(target)
+    expect(importData(target, exportData(source)).ok).toBe(true)
+    live.reload()
+    expect(live.get().background).toBe('white')
+    live.update({ keepAwake: false })
+    expect(live.get().preload).toEqual({ before: 4, after: 7 })
+  })
 })
 
 describe('progress（R-P4、R-P6）', () => {

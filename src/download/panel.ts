@@ -276,21 +276,30 @@ export class DownloadPanel {
       if (p.state === 'downloading' || p.state === 'resolving') {
         insert(btn('暂停', false, () => this.#deps.manager.pause()))
       } else if (p.state === 'paused') {
-        insert(
-          btn('继续', true, () => this.#deps.manager.resumePaused()),
-          btn('取消', false, () => void this.onCancelChoice()),
-        )
+        if (p.note?.includes('另一个标签页')) {
+          insert(btn('重新检查', true, () => this.#deps.manager.resumePaused()))
+        } else {
+          insert(
+            btn('继续', true, () => this.#deps.manager.resumePaused()),
+            btn('取消', false, () => void this.onCancelChoice()),
+          )
+          if (p.storage === 'memory' && p.cachedPages > 0 && p.note?.includes('上限')) {
+            insert(btn('导出部分结果', false, () => void this.#packAndShow(true)))
+          }
+        }
       } else if (p.state === 'incomplete') {
         const failed = p.failedPages > 0
         failList.style.display = failed ? 'block' : 'none'
         if (failed) failList.textContent = `失败 ${p.failedPages} 页；可选择“只重试失败项”，或导出已有部分（文件名加 _partial）`
         insert(
           btn('只重试失败项', true, () => void this.#deps.manager.retryFailed()),
-          btn('导出部分结果', false, () => void this.#deps.manager.pack(true).then(() => this.#showSave())),
+          btn('导出部分结果', false, () => void this.#packAndShow(true)),
           btn('取消任务', false, () => void this.onCancelChoice()),
         )
       } else if (p.state === 'packed') {
         insert(btn('保存 ZIP', true, () => this.#showSave()))
+      } else if (p.state === 'failed') {
+        insert(btn('重新解析并恢复', true, () => void this.#deps.manager.retryFailed()))
       }
     }
 
@@ -368,13 +377,23 @@ export class DownloadPanel {
             result.status === 'saved' ? '已保存' : result.status === 'handed-off' ? '已交给系统下载，请在系统下载记录确认' : `保存失败：${result.detail ?? ''}`
           if (result.status !== 'failed') this.#deps.manager.markHandedOff()
         }),
-        btn('重新打包', false, () => void this.#deps.manager.pack(pack.report.result === 'partial').then(() => this.#showSave())),
+        btn('重新打包', false, () => void this.#packAndShow(pack.report.result === 'partial')),
         btn('清理任务', false, () => {
           void this.#deps.manager.cleanup()
           this.close()
         }),
       ),
     )
+  }
+
+  async #packAndShow(partial: boolean): Promise<void> {
+    try {
+      await this.#deps.manager.pack(partial)
+      this.#showSave()
+    } catch (error) {
+      this.#deps.toast(`打包失败：${error instanceof Error ? error.message : String(error)}`)
+      this.#showProgress()
+    }
   }
 }
 

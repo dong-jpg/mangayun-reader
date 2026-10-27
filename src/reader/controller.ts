@@ -20,6 +20,7 @@ export interface ControllerDeps {
   adapter: SiteAdapter
   settingsStore: SettingsStore
   progress: ProgressStore
+  onActiveChange?(active: boolean): void
 }
 
 interface PageState {
@@ -39,6 +40,9 @@ export class ReaderController {
   #modeKind: ReaderModeKind = 'vertical'
   #active = false
   #wakeLock: WakeLockSentinel | null = null
+  #wakeLockPending: Promise<void> | null = null
+  #wakeLockGeneration = 0
+  #downloadActive = false
   #savedStyles: { el: Element; display: string }[] = []
   #savedScrollLock: { htmlOverscroll: string; bodyOverflow: string } | null = null
 
@@ -88,12 +92,14 @@ export class ReaderController {
   async enter(route: { comic: ComicRef; chapterUrl: string }): Promise<void> {
     if (this.#active) return
     this.#active = true
+    this.#deps.onActiveChange?.(true)
     this.#comic = route.comic
     this.#chapterUrl = route.chapterUrl
     this.#hideSiteReader()
     this.#lockScroll()
     this.#ui?.open()
     this.#applyBackground()
+    void this.requestWakeLock()
 
     const offInfo = this.#deps.adapter.onComicInfo((info) => {
       if (info.ref.siteId === this.#comic?.siteId && info.chapters.length) {
@@ -171,13 +177,14 @@ export class ReaderController {
     this.#active = false
     this.#unmountMode()
     this.#ui?.close()
-    this.#releaseWakeLock()
+    void this.requestWakeLock()
     this.#cleanup.run()
     this.#cleanup = new Cleanup()
     this.#restoreSiteReader()
     this.#restoreScroll()
     this.#pageState = null
     this.#info = null
+    this.#deps.onActiveChange?.(false)
   }
 
   #hideSiteReader(): void {
@@ -362,6 +369,12 @@ export class ReaderController {
 
   handleKey(e: KeyboardEvent): boolean {
     if (!this.#active) return false
+    if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return false
+    const target = e.composedPath()[0] ?? e.target
+    if (e.key !== 'Escape' && (
+      this.#ui?.hasOpenPanel?.() ||
+      (target instanceof Element && target.matches('input, select, textarea, button, a, [contenteditable="true"]'))
+    )) return false
     const rtl = this.settings.direction === 'rtl'
     const forward = rtl ? 'ArrowLeft' : 'ArrowRight'
     const backward = rtl ? 'ArrowRight' : 'ArrowLeft'
@@ -406,20 +419,47 @@ export class ReaderController {
   }
 
   #releaseWakeLock(): void {
-    void this.#wakeLock?.release().catch(() => {})
+    this.#wakeLockGeneration++
+    const sentinel = this.#wakeLock
     this.#wakeLock = null
+    void sentinel?.release().catch(() => {})
+  }
+
+  #needsWakeLock(): boolean {
+    return this.settings.keepAwake && (this.#active || this.#downloadActive) && document.visibilityState !== 'hidden'
+  }
+
+  setDownloadActive(active: boolean): void {
+    if (this.#downloadActive === active) return
+    this.#downloadActive = active
+    void this.requestWakeLock()
   }
 
   async requestWakeLock(): Promise<void> {
-    if (!this.settings.keepAwake) return
+    if (!this.#needsWakeLock()) { this.#releaseWakeLock(); return }
+    if (typeof navigator.wakeLock?.request !== 'function') return
     if (this.#wakeLock && !this.#wakeLock.released) return
-    try {
-      this.#wakeLock = await navigator.wakeLock.request('screen')
-      this.#wakeLock.addEventListener('release', () => {
-        this.#wakeLock = null
-      })
-    } catch {
-      /* 不支持时静默跳过（R-C11） */
-    }
+    if (this.#wakeLockPending) return this.#wakeLockPending
+    const generation = this.#wakeLockGeneration
+    const pending = Promise.resolve().then(async () => {
+      try {
+        const sentinel = await navigator.wakeLock.request('screen')
+        if (generation !== this.#wakeLockGeneration || !this.#needsWakeLock()) {
+          await sentinel.release()
+          return
+        }
+        this.#wakeLock = sentinel
+        sentinel.addEventListener('release', () => {
+          if (this.#wakeLock === sentinel) this.#wakeLock = null
+        })
+      } catch {
+        /* 不支持或用户拒绝时静默跳过（R-C11）。 */
+      }
+    }).finally(() => {
+      if (this.#wakeLockPending === pending) this.#wakeLockPending = null
+      if (generation !== this.#wakeLockGeneration && this.#needsWakeLock()) void this.requestWakeLock()
+    })
+    this.#wakeLockPending = pending
+    return pending
   }
 }

@@ -99,6 +99,30 @@ export function mockServerPlugin() {
       for (const [k, v] of Object.entries(headers)) res.setHeader(k, v)
       res.end(body)
     }
+    // 假“原站阅读器”页面：不发出捕获事件，只渲染 img（含封面/重复干扰），
+    // 供 DOM 抓取兜底路径的 e2e 使用（chapterUrl 任意）
+    if (path.startsWith('/read/')) {
+      const html = `<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div role="dialog" aria-label="漫画阅读器">
+  <img class="thumb-img" referrerpolicy="no-referrer" src="/mock/img/cover.png">
+  <img class="thumb-img" referrerpolicy="no-referrer" src="https://static.example.com/cover/foo.jpg">
+  <div class="reader-pages"></div>
+  <script>
+    setTimeout(() => {
+      const wrap = document.querySelector('.reader-pages')
+      for (let i = 0; i < 5; i++) {
+        const img = document.createElement('img')
+        img.setAttribute('referrerpolicy', 'no-referrer')
+        img.src = '/mock/img/scrape-p' + i + '.png?w=300&h=450'
+        wrap.appendChild(img)
+        if (i === 1) wrap.appendChild(img.cloneNode())
+      }
+    }, 600)
+  </${'script'}>
+</div></body></html>`
+      send(200, html, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      return
+    }
     if (path.startsWith('/mock/img/')) {
       const seed = decodeURIComponent(path.slice('/mock/img/'.length).replace(/\.png$/, ''))
       const w = Number(url.searchParams.get('w') ?? 600)

@@ -11,6 +11,7 @@ import { crc32 } from './crc32'
 export interface ZipSink {
   write(chunk: Uint8Array): Promise<unknown>
   close?(): Promise<unknown>
+  abort?(): Promise<unknown>
 }
 
 interface CentralRecord {
@@ -18,7 +19,6 @@ interface CentralRecord {
   crc: number
   size: number
   localOffset: number
-  zip64: boolean
 }
 
 const SIG_LOCAL = 0x04034b50
@@ -29,6 +29,9 @@ const SIG_LOCATOR64 = 0x07064b50
 const FLAG_UTF8 = 0x0800
 const U32_MAX = 0xffffffff
 const U16_MAX = 0xffff
+const ZIP64_VERSION = 45
+const DEFAULT_VERSION = 20
+const ZIP64_EXTRA_ID = 0x0001
 
 function dosDateTime(d: Date): { time: number; date: number } {
   const year = Math.max(1980, d.getFullYear())
@@ -42,10 +45,23 @@ export class StoreZipWriter {
   #records: CentralRecord[] = []
   #offset = 0
   #closed = false
+  #closePromise: Promise<void> | null = null
   #createdAt = dosDateTime(new Date())
 
   constructor(sink: ZipSink) {
     this.#sink = sink
+  }
+
+  async #write(chunk: Uint8Array): Promise<void> {
+    await this.#sink.write(chunk)
+    this.#offset += chunk.length
+  }
+
+  #writeUint64(view: DataView, offset: number, value: number, label: string): void {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`${label} is not a non-negative safe integer`)
+    }
+    view.setBigUint64(offset, BigInt(value), true)
   }
 
   async add(name: string, data: Uint8Array): Promise<void> {
@@ -53,50 +69,56 @@ export class StoreZipWriter {
     const nameBytes = new TextEncoder().encode(name)
     if (nameBytes.length > U16_MAX) throw new Error('entry name too long')
     const localOffset = this.#offset
-    const zip64 = data.length > U32_MAX || localOffset > U32_MAX
+    const sizeZip64 = data.length >= U32_MAX
+    const offsetZip64 = localOffset >= U32_MAX
+    const zip64 = sizeZip64 || offsetZip64
     const crc = crc32(data)
-    const header = new Uint8Array(30 + nameBytes.length + (zip64 ? 20 : 0))
+    const localExtraLength = sizeZip64 ? 20 : 0
+    const header = new Uint8Array(30 + nameBytes.length + localExtraLength)
     const view = new DataView(header.buffer)
     view.setUint32(0, SIG_LOCAL, true)
-    view.setUint16(4, zip64 ? 45 : 20, true)
+    view.setUint16(4, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true)
     view.setUint16(6, FLAG_UTF8, true)
     view.setUint16(8, 0, true) // method: STORE
     view.setUint16(10, this.#createdAt.time, true)
     view.setUint16(12, this.#createdAt.date, true)
     view.setUint32(14, crc, true)
-    view.setUint32(18, zip64 ? U32_MAX : data.length, true)
-    view.setUint32(22, zip64 ? U32_MAX : data.length, true)
+    view.setUint32(18, sizeZip64 ? U32_MAX : data.length, true)
+    view.setUint32(22, sizeZip64 ? U32_MAX : data.length, true)
     view.setUint16(26, nameBytes.length, true)
-    view.setUint16(28, zip64 ? 20 : 0, true)
+    view.setUint16(28, localExtraLength, true)
     header.set(nameBytes, 30)
-    if (zip64) {
+    if (sizeZip64) {
       const extra = 30 + nameBytes.length
-      view.setUint16(extra, 0x0001, true)
+      view.setUint16(extra, ZIP64_EXTRA_ID, true)
       view.setUint16(extra + 2, 16, true)
-      view.setUint32(extra + 4, data.length, true) // 低 32 位（小端写入两段 32 位等价于 64 位小端）
-      view.setUint32(extra + 8, 0, true)
-      view.setUint32(extra + 12, data.length, true)
-      view.setUint32(extra + 16, 0, true)
+      this.#writeUint64(view, extra + 4, data.length, 'entry size')
+      this.#writeUint64(view, extra + 12, data.length, 'entry compressed size')
     }
-    await this.#sink.write(header)
-    await this.#sink.write(data)
-    this.#offset += header.length + data.length
-    this.#records.push({ nameBytes, crc, size: data.length, localOffset, zip64 })
+    await this.#write(header)
+    await this.#write(data)
+    this.#records.push({ nameBytes, crc, size: data.length, localOffset })
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise
     this.#closed = true
+    this.#closePromise = this.#close()
+    return this.#closePromise
+  }
+
+  async #close(): Promise<void> {
     const cdStart = this.#offset
     for (const rec of this.#records) {
-      const offsetNeeds64 = rec.localOffset > U32_MAX
-      const sizeNeeds64 = rec.size > U32_MAX
-      const extraLen = rec.zip64 ? (sizeNeeds64 ? 24 : 0) + (offsetNeeds64 ? 8 : 0) || 20 : 0
+      const offsetNeeds64 = rec.localOffset >= U32_MAX
+      const sizeNeeds64 = rec.size >= U32_MAX
+      const zip64 = sizeNeeds64 || offsetNeeds64
+      const extraLen = zip64 ? 4 + (sizeNeeds64 ? 16 : 0) + (offsetNeeds64 ? 8 : 0) : 0
       const buf = new Uint8Array(46 + rec.nameBytes.length + extraLen)
       const view = new DataView(buf.buffer)
       view.setUint32(0, SIG_CENTRAL, true)
-      view.setUint16(4, rec.zip64 ? 45 : 20, true)
-      view.setUint16(6, rec.zip64 ? 45 : 20, true)
+      view.setUint16(4, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true)
+      view.setUint16(6, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true)
       view.setUint16(8, FLAG_UTF8, true)
       view.setUint16(10, 0, true)
       view.setUint16(12, this.#createdAt.time, true)
@@ -112,64 +134,59 @@ export class StoreZipWriter {
       view.setUint32(38, 0, true)
       view.setUint32(42, offsetNeeds64 ? U32_MAX : rec.localOffset, true)
       buf.set(rec.nameBytes, 46)
-      if (rec.zip64) {
+      if (zip64) {
         let p = 46 + rec.nameBytes.length
-        view.setUint16(p, 0x0001, true)
+        view.setUint16(p, ZIP64_EXTRA_ID, true)
         view.setUint16(p + 2, extraLen - 4, true)
         p += 4
         if (sizeNeeds64) {
-          view.setUint32(p, rec.size, true)
-          view.setUint32(p + 4, 0, true)
-          view.setUint32(p + 8, rec.size, true)
-          view.setUint32(p + 12, 0, true)
+          this.#writeUint64(view, p, rec.size, 'central entry size')
+          this.#writeUint64(view, p + 8, rec.size, 'central entry compressed size')
           p += 16
         }
         if (offsetNeeds64) {
-          view.setUint32(p, rec.localOffset, true)
-          view.setUint32(p + 4, 0, true)
+          this.#writeUint64(view, p, rec.localOffset, 'central local-header offset')
         }
       }
-      await this.#sink.write(buf)
+      await this.#write(buf)
     }
     const cdSize = this.#offset - cdStart
     const needZip64Eocd =
-      this.#records.length > U16_MAX || cdStart > U32_MAX || cdSize > U32_MAX
+      this.#records.length >= U16_MAX || cdStart >= U32_MAX || cdSize >= U32_MAX
     if (needZip64Eocd) {
       const zip64Offset = this.#offset
       const eocd64 = new Uint8Array(56)
       const v64 = new DataView(eocd64.buffer)
       v64.setUint32(0, SIG_EOCD64, true)
       v64.setBigUint64(4, BigInt(44), true)
-      v64.setUint16(12, 45, true)
-      v64.setUint16(14, 45, true)
+      v64.setUint16(12, ZIP64_VERSION, true)
+      v64.setUint16(14, ZIP64_VERSION, true)
       v64.setUint32(16, 0, true)
       v64.setUint32(20, 0, true)
       v64.setBigUint64(24, BigInt(this.#records.length), true)
       v64.setBigUint64(32, BigInt(this.#records.length), true)
       v64.setBigUint64(40, BigInt(cdSize), true)
       v64.setBigUint64(48, BigInt(cdStart), true)
-      await this.#sink.write(eocd64)
+      await this.#write(eocd64)
       const locator = new Uint8Array(20)
       const vl = new DataView(locator.buffer)
       vl.setUint32(0, SIG_LOCATOR64, true)
       vl.setUint32(4, 0, true)
       vl.setBigUint64(8, BigInt(zip64Offset), true)
       vl.setUint32(16, 1, true)
-      await this.#sink.write(locator)
-      this.#offset += 76
+      await this.#write(locator)
     }
     const eocd = new Uint8Array(22)
     const ve = new DataView(eocd.buffer)
     ve.setUint32(0, SIG_EOCD, true)
     ve.setUint16(4, 0, true)
     ve.setUint16(6, 0, true)
-    ve.setUint16(8, this.#records.length > U16_MAX ? U16_MAX : this.#records.length, true)
-    ve.setUint16(10, this.#records.length > U16_MAX ? U16_MAX : this.#records.length, true)
-    ve.setUint32(12, cdSize > U32_MAX ? U32_MAX : cdSize, true)
-    ve.setUint32(16, cdStart > U32_MAX ? U32_MAX : cdStart, true)
+    ve.setUint16(8, needZip64Eocd ? U16_MAX : this.#records.length, true)
+    ve.setUint16(10, needZip64Eocd ? U16_MAX : this.#records.length, true)
+    ve.setUint32(12, needZip64Eocd ? U32_MAX : cdSize, true)
+    ve.setUint32(16, needZip64Eocd ? U32_MAX : cdStart, true)
     ve.setUint16(20, 0, true)
-    await this.#sink.write(eocd)
-    this.#offset += 22
+    await this.#write(eocd)
     await this.#sink.close?.()
   }
 

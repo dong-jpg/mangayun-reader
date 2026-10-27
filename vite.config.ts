@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import monkey from 'vite-plugin-monkey'
+import { version } from './package.json'
 
 export default defineConfig({
   plugins: [
@@ -8,7 +9,7 @@ export default defineConfig({
       userscript: {
         name: 'MangaYun Reader',
         namespace: 'https://github.com/dong-jpg/mangayun-reader',
-        version: '1.0.4',
+        version,
         description: '云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）',
         author: 'dong-jpg',
         match: ['https://mangayun.com/*'],
@@ -21,6 +22,7 @@ export default defineConfig({
           'GM_listValues',
           'GM_xmlhttpRequest',
           'GM_download',
+          'unsafeWindow',
         ],
         // 实测（docs/specs/site-probe-2026-10-24.md）会直连的图片域名；
         // 未列出的域名由 Tampermonkey 询问用户。

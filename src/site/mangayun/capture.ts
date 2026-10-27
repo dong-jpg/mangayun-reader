@@ -237,18 +237,42 @@ export class CaptureBus {
 
   #installPageCapture(): void {
     // 首选：内联 <script> 注入页面上下文（同步执行）
-    try {
-      const el = document.createElement('script')
-      el.textContent = captureInjectSource(this.#token)
-      document.documentElement.appendChild(el)
-      el.remove()
-      const page = getUnsafeWindow()
-      // unsafeWindow 可用时核对页面标记；不可用时按注入成功处理（e2e 兜底）
-      if (!page || page[PAGE_FLAG] === this.#token) return
-    } catch {
-      /* CSP 或其他注入失败，走回退 */
+    if (this.#tryInjectInline()) return
+    // 极早期注入（TM Instant 等场景）时 <html> 可能尚不存在：等 DOM 就绪后重试
+    if (!document.documentElement) {
+      const retry = (): void => {
+        if (!document.documentElement) return
+        if (!this.#tryInjectInline()) this.#wrapUnsafeWindow()
+      }
+      if (document.readyState === 'loading') {
+        document.addEventListener('readystatechange', retry, { once: true })
+        document.addEventListener('DOMContentLoaded', retry, { once: true })
+      } else {
+        retry()
+      }
+      return
     }
     // 回退：直接包装 unsafeWindow.fetch（§4.8），逻辑与注入版本一致
+    this.#wrapUnsafeWindow()
+  }
+
+  #tryInjectInline(): boolean {
+    try {
+      const root = document.documentElement
+      if (!root) return false
+      const el = document.createElement('script')
+      el.textContent = captureInjectSource(this.#token)
+      root.appendChild(el)
+      el.remove()
+      const page = getUnsafeWindow()
+      // unsafeWindow 可用时核对页面标记；不可用时按注入成功处理
+      return !page || page[PAGE_FLAG] === this.#token
+    } catch {
+      return false
+    }
+  }
+
+  #wrapUnsafeWindow(): void {
     const page = getUnsafeWindow()
     if (!page || page[PAGE_FLAG] || !page.fetch) return
     page[PAGE_FLAG] = this.#token

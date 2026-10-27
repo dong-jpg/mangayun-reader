@@ -1,6 +1,6 @@
 {
   "name": "mangayun-reader",
-  "version": "1.0.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "云漫（mangayun.com）增强阅读器油猴脚本：三种阅读模式、进度记忆与章节下载",
@@ -17,7 +17,8 @@
     "e2e": "playwright test",
     "samples": "node scripts/make-samples.mjs",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "verify:samples": "node scripts/verify-samples.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.28.0",

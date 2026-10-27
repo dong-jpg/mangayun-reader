@@ -655,3 +655,13 @@ const MEMORY_MODE_CAP_MIB = 100;        // 固定值，不提供设置（§7 D7�
 
 - 根因：横屏“适应高度”下一屏可见 3~4 页，而预加载窗口按“当前页(视口中线所在页)-1/+3”计算；参考线一翻页，仍部分可见的第 N-2 页即被卸载 `src` 露出底色，回挪一点参考线翻回即恢复——与真机“挪一点点图片就出来”现象吻合，快速滑动时反复发生即闪屏。
 - 修复：`PageWindow.update` 增加“可见范围”参数（视口内实际可见的首页/末页，两轴相交判定），窗口 = [min(可见首,当前)-before, max(可见末,当前)+after]，可见页永不因参考线翻页被卸载。e2e 第 12 项精确复现原场景（横屏、参考线贴页边界翻页）断言可见页全部持有 src。
+
+### 增量（2026-10-26，桌面端“图片清单获取失败”）
+
+- 根因（Playwright 真站诊断实锤）：桌面 Chrome 下 `document-start` 时刻 `document.documentElement` 尚为 `null`，捕获层的内联 `<script>` 注入抛 `TypeError` 被静默吞掉；v1.0.4 未授予 `unsafeWindow`，沙箱回退包装也不可用——捕获层从未装上，`resolveChapter` 等 20s 超时报“图片清单获取失败”。移动端 TM 注入时机更晚（`documentElement` 已存在）故不受影响。同时排除了两个嫌疑：站点无 CSP（响应头与 meta 均无）；PWA Service Worker 明确放行 `/api/`（非 GET 直接 return，与 `fetch` 包装无冲突）。
+- 修复（偏差按 §6.3 记录理由）：
+  1. `capture.ts`：注入失败且 `<html>` 不存在时，挂 `readystatechange`/`DOMContentLoaded`（once）重试注入，仍失败再退 `unsafeWindow` 包装。真站验证 `interactive` 阶段注入成功，且按 HTML 规范早于站点 Vue 模块脚本执行（defer/非阻塞），赶在首次 `/api` 请求之前。§4.8 预留的 `@grant unsafeWindow` 一并补上。
+  2. `batch-resolver.ts`：新增方案外降级路径 `scrapeReaderImages`——捕获等待超时后轮询 iframe（或顶层）原站阅读器 DOM 中 `img[referrerpolicy="no-referrer"]` 的 `src`（文档序去重、过滤封面缩略图），同源可读、不依赖捕获层。理由：桌面 TM 沙箱/CSP 变化下捕获层可能整体失效，DOM 抓取是保底可用性（N-5 降级要求），不改变 §3.2 约束（仍不签名、不改请求）。
+  3. `adapter.ts`：顶层原站阅读器正在显示目标章节时直接抓 DOM（零网络零延迟）。
+- 测试：单测新增 `scrape.test.ts`（4 项：文档序去重、封面过滤、expando 排除、空 src 跳过）；e2e 新增 `resolver-scrape.spec.ts`（捕获 3s 超时后转 DOM 抓取，5 张 + 封面过滤断言）。harness mock 页修一处 expando bug：`img.referrerpolicy = …`（小写）不会成为内容属性，须 `setAttribute('referrerpolicy', …)`，否则选择器匹配不到动态创建的图。
+- v1.1.1（单元 153 + e2e 23 全绿，typecheck/lint 干净）。

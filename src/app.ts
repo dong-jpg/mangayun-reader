@@ -23,12 +23,12 @@ export interface AppHandle {
   kv: KV
 }
 
-export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHandle {
+export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV; onReaderActiveChange?(active: boolean): void }): AppHandle {
   const kv = deps.kv ?? createKV()
   const settingsStore = new SettingsStore(kv)
   const progress = new ProgressStore(kv)
 
-  const controller = new ReaderController({ adapter: deps.adapter, settingsStore, progress })
+  const controller = new ReaderController({ adapter: deps.adapter, settingsStore, progress, onActiveChange: deps.onReaderActiveChange })
 
   const actions: UIActions = {
     exit: () => controller.exit(),
@@ -69,7 +69,7 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
     },
     setKeepAwake: (on) => {
       settingsStore.update({ keepAwake: on })
-      if (on) void controller.requestWakeLock()
+      void controller.requestWakeLock()
     },
     setAutoEnter: (on) => {
       settingsStore.update({ autoEnter: on })
@@ -77,6 +77,12 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
     setTapInContinuous: (on) => {
       settingsStore.update({ tapInContinuous: on })
       controller.applySettingChanges()
+    },
+    setDownloadConcurrency: (value) => {
+      settingsStore.update({ download: { concurrency: value } })
+    },
+    resetEntryPosition: () => {
+      settingsStore.update({ floatPos: undefined })
     },
     jumpToPage: (page) => controller.jumpToPage(page),
     jumpToChapter: (chapter) => controller.navigateToChapter(chapter),
@@ -88,7 +94,15 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
     toggleFullscreen: () => void controller.toggleFullscreen(),
     openDownload: () => panel.open(),
     exportSettings: () => exportData(kv),
-    importSettings: (json) => importData(kv, json),
+    importSettings: (json) => {
+      const result = importData(kv, json)
+      if (result.ok) {
+        settingsStore.reload()
+        controller.applySettingChanges()
+        void controller.requestWakeLock()
+      }
+      return result
+    },
     settings: () => settingsStore.effective(controller.comic),
   }
 
@@ -102,9 +116,7 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
     onProgress: (p) => {
       panel.onProgress(p)
       // R-C11：阅读和下载时请求 Wake Lock（可关闭，不支持时静默跳过）
-      if (p.state === 'downloading' || p.state === 'resolving' || p.state === 'packing') {
-        void controller.requestWakeLock()
-      }
+      controller.setDownloadActive(p.state === 'downloading' || p.state === 'resolving' || p.state === 'packing')
     },
     onPacked: (handle) => panel.onPacked(handle),
   })
@@ -138,7 +150,7 @@ export function createReaderApp(deps: { adapter: SiteAdapter; kv?: KV }): AppHan
   // 离开/隐藏时立即保存进度（R-P4）
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') progress.flush()
-    else void controller.requestWakeLock()
+    void controller.requestWakeLock()
   })
   window.addEventListener('pagehide', () => progress.flush())
 

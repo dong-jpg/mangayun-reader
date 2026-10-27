@@ -1,47 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { StoreZipWriter } from '../../src/utils/zip-store'
-import { crc32 } from '../../src/utils/crc32'
-
-/** 极简 ZIP 读取器：解析 STORE 条目并核对内容与 CRC。 */
-function readStoreZip(bytes: Uint8Array): Map<string, Uint8Array> {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-  const decoder = new TextDecoder()
-  // 从尾部找 EOCD
-  let eocd = -1
-  for (let i = bytes.length - 22; i >= 0; i--) {
-    if (view.getUint32(i, true) === 0x06054b50) {
-      eocd = i
-      break
-    }
-  }
-  if (eocd < 0) throw new Error('EOCD not found')
-  const count = view.getUint16(eocd + 10, true)
-  let offset = view.getUint32(eocd + 16, true)
-  const entries = new Map<string, Uint8Array>()
-  for (let i = 0; i < count; i++) {
-    if (view.getUint32(offset, true) !== 0x02014b50) throw new Error(`bad central sig @${offset}`)
-    const crc = view.getUint32(offset + 16, true)
-    const size = view.getUint32(offset + 24, true)
-    const nameLen = view.getUint16(offset + 28, true)
-    const extraLen = view.getUint16(offset + 30, true)
-    const commentLen = view.getUint16(offset + 32, true)
-    const localOffset = view.getUint32(offset + 42, true)
-    const name = decoder.decode(bytes.subarray(offset + 46, offset + 46 + nameLen))
-    // 读取本地头拿数据
-    const lNameLen = view.getUint16(localOffset + 26, true)
-    const lExtraLen = view.getUint16(localOffset + 28, true)
-    const dataStart = localOffset + 30 + lNameLen + lExtraLen
-    const data = bytes.subarray(dataStart, dataStart + size)
-    if (crc32(data) !== crc) throw new Error(`crc mismatch for ${name}`)
-    entries.set(name, new Uint8Array(data))
-    offset += 46 + nameLen + extraLen + commentLen
-  }
-  return entries
-}
-
-function bytesOf(entries: Map<string, Uint8Array>, name: string): number[] {
-  return Array.from(entries.get(name) ?? [])
-}
+import { readStoredZip } from './archive-test-helpers'
 
 function containsSubsequence(haystack: Uint8Array, needle: Uint8Array): boolean {
   outer: for (let start = 0; start <= haystack.length - needle.length; start++) {
@@ -85,11 +44,18 @@ describe('StoreZipWriter', () => {
     await writer.add('comic/download-report.json', new TextEncoder().encode('{"ok":true}'))
     await writer.close()
     expect(sink.closed).toBe(true)
-    const entries = readStoreZip(sink.bytes())
+    const output = sink.bytes()
+    const archive = readStoredZip(output)
+    const entries = new Map(archive.entries.map((entry) => [entry.name, entry]))
     expect(entries.size).toBe(3)
-    expect(bytesOf(entries, 'comic/0001_第1话/0001.jpg')).toEqual(Array.from(a))
-    expect(bytesOf(entries, 'comic/0001_第1话/0002.png')).toEqual(Array.from(b))
-    expect(new TextDecoder().decode(entries.get('comic/download-report.json')!)).toBe('{"ok":true}')
+    expect(Array.from(entries.get('comic/0001_第1话/0001.jpg')!.data)).toEqual(Array.from(a))
+    expect(Array.from(entries.get('comic/0001_第1话/0002.png')!.data)).toEqual(Array.from(b))
+    expect(new TextDecoder().decode(entries.get('comic/download-report.json')!.data)).toBe('{"ok":true}')
+    expect(archive.centralDirectorySize).toBeGreaterThan(0)
+    expect(archive.centralDirectoryOffset + archive.centralDirectorySize).toBe(archive.eocdOffset)
+    expect(archive.eocdEntryCount).toBe(3)
+    expect(writer.byteLength).toBe(output.length)
+    expect(writer.entryCount).toBe(3)
   })
 
   it('STORE 方式（method=0），无压缩', async () => {
@@ -103,6 +69,10 @@ describe('StoreZipWriter', () => {
     const found = Array.from(data).every((_, i) => all.includes(data[i]!)) &&
       containsSubsequence(all, data)
     expect(found).toBe(true)
+    const archive = readStoredZip(all)
+    expect(archive.entries).toHaveLength(1)
+    expect(archive.entries[0]!.method).toBe(0)
+    expect(Array.from(archive.entries[0]!.data)).toEqual(Array.from(data))
   })
 
   it('空文件名列表与多次 close 幂等', async () => {
@@ -110,19 +80,29 @@ describe('StoreZipWriter', () => {
     const writer = new StoreZipWriter(sink)
     await writer.close()
     await writer.close()
-    const entries = readStoreZip(sink.bytes())
-    expect(entries.size).toBe(0)
+    const output = sink.bytes()
+    const archive = readStoredZip(output)
+    expect(archive.entries).toHaveLength(0)
+    expect(archive.centralDirectorySize).toBe(0)
+    expect(writer.byteLength).toBe(output.length)
   })
 
-  it('大条目数（Zip64 路径 sanity：>65535 可构建 EOCD 兜底字段）', async () => {
+  it.each([65_535, 65_536])('%i entries use readable Zip64 counts and locator offsets', async (count) => {
     const sink = new ArraySink()
     const writer = new StoreZipWriter(sink)
-    const tiny = new Uint8Array(1)
-    // 200 条足够验证结构与计数一致性；Zip64 分支由字节布局保证
-    for (let i = 0; i < 200; i++) await writer.add(`f/${i}.bin`, tiny)
+    const empty = new Uint8Array(0)
+    for (let i = 0; i < count; i++) await writer.add(`f/${i}.bin`, empty)
     await writer.close()
-    const entries = readStoreZip(sink.bytes())
-    expect(entries.size).toBe(200)
-    expect(writer.entryCount).toBe(200)
-  })
+    const output = sink.bytes()
+    const archive = readStoredZip(output)
+    expect(archive.entries).toHaveLength(count)
+    expect(archive.entries[0]!.name).toBe('f/0.bin')
+    expect(archive.entries.at(-1)!.name).toBe(`f/${count - 1}.bin`)
+    expect(archive.zip64).toBe(true)
+    expect(archive.zip64EntryCount).toBe(count)
+    expect(archive.eocdEntryCount).toBe(0xffff)
+    expect(archive.zip64EocdOffset).not.toBeNull()
+    expect(writer.entryCount).toBe(count)
+    expect(writer.byteLength).toBe(output.length)
+  }, 30_000)
 })

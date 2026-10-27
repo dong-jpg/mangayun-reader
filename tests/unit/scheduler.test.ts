@@ -152,6 +152,36 @@ describe('scheduler（R-D6、R-D7、R-D10）', () => {
     expect((await Promise.all(outcomes)).every((o) => o.status === 'done')).toBe(true)
   })
 
+  it('explicit Retry-After can exceed the fallback backoff cap', async () => {
+    const scheduler = new Scheduler(1)
+    let attempts = 0
+    const result = scheduler.submit({ key: 'long-wait', run: async () => {
+      if (++attempts === 1) throw new FetchFailure('http-429', 'wait', 429, 120_000)
+    } })
+    await vi.advanceTimersByTimeAsync(119_999)
+    expect(attempts).toBe(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect((await result).status).toBe('done')
+    scheduler.cancel()
+  })
+
+  it('pause and resume do not bypass an active Retry-After deadline', async () => {
+    const scheduler = new Scheduler(1)
+    let attempts = 0
+    const result = scheduler.submit({ key: 'resume-wait', run: async () => {
+      if (++attempts === 1) throw new FetchFailure('http-429', 'wait', 429, 5000)
+    } })
+    await vi.advanceTimersByTimeAsync(1000)
+    scheduler.pause()
+    await vi.advanceTimersByTimeAsync(1000)
+    scheduler.resume()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(attempts).toBe(1)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect((await result).status).toBe('done')
+    scheduler.cancel()
+  })
+
   it('取消后迟到的回调被丢弃', async () => {
     const scheduler = new Scheduler(2)
     const d1 = deferred()

@@ -157,7 +157,7 @@ export class Scheduler {
     const retryAfter = failure?.retryAfterMs
     let waitMs: number
     if (retryAfter != null && retryAfter > 0) {
-      waitMs = Math.min(MAX_BACKOFF_MS, retryAfter)
+      waitMs = retryAfter
     } else {
       waitMs = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** this.#rateLimitHits)
     }
@@ -186,11 +186,6 @@ export class Scheduler {
   /** 用户暂停：立即停止发起新请求（R-D6）。 */
   pause(): void {
     this.#running = false
-    if (this.#pauseTimer != null) {
-      clearTimeout(this.#pauseTimer)
-      this.#pauseTimer = null
-      this.#globalPauseUntil = 0
-    }
   }
 
   resume(): void {

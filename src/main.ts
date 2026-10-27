@@ -43,7 +43,14 @@ if (typeof window !== 'undefined' && isResolveIframe(window.name)) {
     const bus = new CaptureBus()
     bus.start()
     const adapter = createMangayunAdapter(bus)
-    const app = createReaderApp({ adapter, kv })
+    const entryRef: { current?: FloatingEntry } = {}
+    const app = createReaderApp({
+      adapter, kv,
+      onReaderActiveChange: (active) => {
+        if (active) entryRef.current?.hide()
+        else if (adapter.currentReadRoute()) entryRef.current?.show()
+      },
+    })
     const { controller, ui, settingsStore } = app
 
     // ---------- 悬浮入口与路由（§4.4 事件与路由） ----------
@@ -55,17 +62,20 @@ if (typeof window !== 'undefined' && isResolveIframe(window.name)) {
       loadPosition: () => settingsStore.get().floatPos,
       savePosition: (pos) => settingsStore.update({ floatPos: pos }),
     })
+    entryRef.current = entry
 
     function syncRoute(): void {
       const route = adapter.currentReadRoute()
       if (route && !controller.active) {
-        entry.show()
+        entry?.show()
         ui.setCurrentChapter(route.chapterUrl)
         const settings = settingsStore.effective(route.comic)
         if (settings.autoEnter) void controller.enter(route)
       } else if (!route) {
-        entry.hide()
+        entry?.hide()
         if (controller.active) controller.exit()
+      } else {
+        entry?.hide()
       }
     }
 

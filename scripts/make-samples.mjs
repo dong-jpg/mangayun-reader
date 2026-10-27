@@ -4,10 +4,11 @@
  * - samples/sample-multi-skip.zip：跳选第 1、3 话（跳过第 2 话 → 文件夹保持 0001/0003 全局序号，R-D3）
  * 由 harness 页 + mock 适配器驱动真实下载流水线产生，并解包核验报告与条目。
  */
-import { execSync, spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { chromium } from '@playwright/test'
+import { verifySamples } from './verify-samples.mjs'
 
 const PORT = 4180
 const ROOT = resolve(import.meta.dirname, '..')
@@ -18,33 +19,35 @@ function log(...args) {
 
 async function main() {
   log('构建 harness…')
-  execSync('npx vite build --config harness/vite.config.ts', { cwd: ROOT, stdio: 'pipe' })
+  const vite = resolve(ROOT, 'node_modules/vite/bin/vite.js')
+  execFileSync(process.execPath, [vite, 'build', '--config', 'harness/vite.config.ts'], { cwd: ROOT, stdio: 'pipe', windowsHide: true })
 
   const server = spawn(
-    'npx',
-    ['vite', 'preview', '--config', 'harness/vite.config.ts', '--host', '127.0.0.1', '--port', String(PORT), '--strictPort'],
-    { cwd: ROOT, shell: true, stdio: 'pipe' },
+    process.execPath,
+    [vite, 'preview', '--config', 'harness/vite.config.ts', '--host', '127.0.0.1', '--port', String(PORT), '--strictPort'],
+    { cwd: ROOT, stdio: 'pipe', windowsHide: true },
   )
+  let browser
   try {
-    await waitForServer(PORT)
-    const browser = await chromium.launch()
+    await waitForServer(PORT, server)
+    browser = await chromium.launch()
     const ctx = await browser.newContext({ viewport: { width: 412, height: 915 } })
     const page = await ctx.newPage()
 
     const single = await downloadAsBase64(page, [2]) // 第3话
     const multi = await downloadAsBase64(page, [0, 2]) // 第1话 + 第3话（跳过第2话）
 
-    mkdirSync(resolve(ROOT, 'samples'), { recursive: true })
     const singleBuf = Buffer.from(single.base64, 'base64')
     const multiBuf = Buffer.from(multi.base64, 'base64')
+    verifySamples(['--stdin', 'sample-single-chapter.zip'], singleBuf)
+    verifySamples(['--stdin', 'sample-multi-skip.zip'], multiBuf)
+    mkdirSync(resolve(ROOT, 'samples'), { recursive: true })
     writeFileSync(resolve(ROOT, 'samples', 'sample-single-chapter.zip'), singleBuf)
     writeFileSync(resolve(ROOT, 'samples', 'sample-multi-skip.zip'), multiBuf)
 
-    verify('sample-single-chapter.zip', singleBuf, ['0003_第3话'])
-    verify('sample-multi-skip.zip', multiBuf, ['0001_第1话', '0003_第3话'])
-    await browser.close()
     log('完成：samples/ 下两个样本 ZIP 已生成并核验')
   } finally {
+    await browser?.close()
     server.kill()
   }
 }
@@ -93,58 +96,31 @@ async function downloadAsBase64(page, chapterIndexes) {
   }, chapterIndexes)
 }
 
-/** 极简 ZIP 核验：EOCD → 中央目录 → 条目名 + download-report.json 内容。 */
-function verify(name, buf, expectedFolders) {
-  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength)
-  let eocd = -1
-  for (let i = buf.length - 22; i >= 0; i--) {
-    if (view.getUint32(i, true) === 0x06054b50) {
-      eocd = i
-      break
+async function waitForServer(port, server) {
+  let output = ''
+  let errors = ''
+  const readOutput = (chunk) => { output += chunk.toString() }
+  const readError = (chunk) => { errors += chunk.toString() }
+  server.stdout.on('data', readOutput)
+  server.stderr.on('data', readError)
+  try {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      if (server.exitCode !== null || server.signalCode !== null) {
+        throw new Error(`Preview server exited before startup: ${errors}`)
+      }
+      if (output.includes(`http://127.0.0.1:${port}/`)) {
+        try {
+          const response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1000) })
+          if (response.ok) return
+        } catch { /* Wait until the announced server accepts requests. */ }
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 500))
     }
+    throw new Error(`Preview server startup timed out: ${errors}`)
+  } finally {
+    server.stdout.off('data', readOutput)
+    server.stderr.off('data', readError)
   }
-  if (eocd < 0) throw new Error(`${name}: EOCD 未找到`)
-  const count = view.getUint16(eocd + 10, true)
-  let offset = view.getUint32(eocd + 16, true)
-  const entries = []
-  for (let i = 0; i < count; i++) {
-    if (view.getUint32(offset, true) !== 0x02014b50) throw new Error(`${name}: 中央目录签名错误`)
-    const nameLen = view.getUint16(offset + 28, true)
-    const extraLen = view.getUint16(offset + 30, true)
-    const commentLen = view.getUint16(offset + 32, true)
-    entries.push(buf.subarray(offset + 46, offset + 46 + nameLen).toString('utf8'))
-    offset += 46 + nameLen + extraLen + commentLen
-  }
-  const folders = [...new Set(entries.map((e) => e.split('/')[1]).filter((f) => f && f !== 'download-report.json'))]
-  for (const folder of expectedFolders) {
-    if (!folders.includes(folder)) throw new Error(`${name}: 缺少文件夹 ${folder}（实际：${folders.join(',')}）`)
-  }
-  if (!entries.some((e) => e.endsWith('/download-report.json'))) {
-    throw new Error(`${name}: 缺少 download-report.json`)
-  }
-  log(`${name} 核验通过：${count} 条目，文件夹 ${folders.join(' / ')}`)
-}
-
-function waitForServer(port) {
-  return new Promise((resolveWait, reject) => {
-    let tries = 0
-    const timer = setInterval(async () => {
-      tries++
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/`)
-        if (res.ok) {
-          clearInterval(timer)
-          resolveWait()
-        }
-      } catch {
-        /* 尚未就绪 */
-      }
-      if (tries > 60) {
-        clearInterval(timer)
-        reject(new Error('preview 服务器启动超时'))
-      }
-    }, 500)
-  })
 }
 
 main().catch((e) => {

@@ -2,8 +2,22 @@
  * 增强阅读器全部样式（Shadow DOM 内，与原站隔离）。
  * 按钮 ≥48px、适配安全区（R-C9）；纵向防下拉刷新、横向零间隙等模式布局。
  */
+import { SETTINGS_STYLES } from './settings-styles'
+
 export const STYLES = `
-:host { all: initial }
+:host {
+  all: initial;
+  --myr-ink: #11151e;
+  --myr-panel: #1b2230;
+  --myr-card: #232c3b;
+  --myr-line: #344052;
+  --myr-text: #eef3fa;
+  --myr-muted: #a0afc3;
+  --myr-accent: #9fc3ff;
+}
+*, *::before, *::after { box-sizing: border-box }
+[hidden] { display: none !important }
+.myr-icon { display: block; width: 22px; height: 22px; flex: 0 0 auto }
 
 .myr-root {
   position: fixed; inset: 0;
@@ -16,7 +30,7 @@ export const STYLES = `
 .myr-bg-black { background: #000 }
 .myr-bg-gray { background: #3f3f46 }
 .myr-bg-white { background: #fff }
-.myr-bg-system { background: light-dark(#fff, #000) }
+.myr-bg-system { color-scheme: light dark; background: light-dark(#fff, #000) }
 
 /* ---------- 阅读模式 ---------- */
 .myr-mode-root { position: absolute; inset: 0; overflow: hidden }
@@ -145,7 +159,7 @@ export const STYLES = `
 }
 .myr-btn:active { background: #333338 }
 .myr-btn-primary { background: #2f6fed; border-color: #2f6fed; color: #fff }
-.myr-btn-small { min-width: 40px; min-height: 40px; padding: 0 10px; font-size: 13px }
+.myr-btn-small { min-width: 48px; min-height: 48px; padding: 0 10px; font-size: 13px }
 .myr-seg-active { background: #3a5bcc; border-color: #5a78e0; color: #fff }
 .myr-title {
   flex: 1; text-align: center; font-size: 15px;
@@ -270,13 +284,21 @@ export const STYLES = `
 
 /* ---------- 悬浮入口（R-C1） ---------- */
 .myr-entry {
-  position: fixed; z-index: 2147483646;
-  min-width: 52px; min-height: 52px; border-radius: 26px;
-  border: 1px solid rgba(255, 255, 255, .35);
-  background: rgba(20, 20, 24, .82); color: #fff;
-  font-size: 13px; display: flex; align-items: center; justify-content: center;
-  padding: 0 14px; cursor: pointer; user-select: none;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
-  touch-action: none;
+  position: relative; width: 52px; height: 52px; padding: 0;
+  border-radius: 18px; border: 1px solid rgba(174, 203, 244, .4);
+  background: linear-gradient(145deg, #2c405c, #152030 75%); color: #d8e8ff;
+  display: grid; place-items: center; cursor: grab; user-select: none;
+  -webkit-tap-highlight-color: transparent; touch-action: none;
+  box-shadow: 0 6px 20px #02091240, inset 0 1px 0 #ffffff16;
+  transition: background .18s ease, box-shadow .18s ease;
 }
+.myr-entry .myr-icon { width: 27px; height: 27px }
+.myr-entry::after {
+  content: ''; position: absolute; right: 7px; top: 7px;
+  width: 4px; height: 4px; border-radius: 50%; background: #adcbff;
+}
+.myr-entry:hover { background: linear-gradient(145deg, #3b5476, #1b293e 75%) }
+.myr-entry:active, .myr-entry-dragging { cursor: grabbing; box-shadow: 0 8px 26px #02091265 }
+.myr-entry:focus-visible { outline: 3px solid #9fc3ff; outline-offset: 4px }
+${SETTINGS_STYLES}
 `

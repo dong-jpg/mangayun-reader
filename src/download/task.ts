@@ -100,7 +100,7 @@ export function listTasks(kv: KV): DownloadTaskData[] {
 /** 可恢复的任务（R-D13）。 */
 export function resumableTasks(kv: KV): DownloadTaskData[] {
   return listTasks(kv).filter((t) =>
-    t.state === 'resolving' || t.state === 'downloading' || t.state === 'paused' || t.state === 'incomplete',
+    t.state === 'resolving' || t.state === 'downloading' || t.state === 'paused' || t.state === 'incomplete' || t.state === 'failed',
   )
 }
 

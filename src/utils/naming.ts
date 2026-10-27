@@ -50,5 +50,6 @@ export function comicRootName(title: string): string {
 }
 
 export function partialSuffix(name: string): string {
-  return `${name}_partial`
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? `${name.slice(0, dot)}_partial${name.slice(dot)}` : `${name}_partial`
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaYun Reader
 // @namespace    https://github.com/dong-jpg/mangayun-reader
-// @version      1.0.4
+// @version      1.1.1
 // @author       dong-jpg
 // @description  云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）
 // @license      MIT
@@ -19,6 +19,7 @@
 // @grant        GM_listValues
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
@@ -282,6 +283,21 @@
   }
   const RESOLVE_IFRAME_NAME_PREFIX = "myr-resolve:v1:";
   const RESOLVE_IFRAME_MIN_GAP_MS = 1e3;
+  const CAPTURE_TIMEOUT_MS = 2e4;
+  const SCRAPE_TIMEOUT_MS = 15e3;
+  function scrapeReaderImages(doc) {
+    const out = [];
+    const seen = /* @__PURE__ */ new Set();
+    for (const img of doc.querySelectorAll('img[referrerpolicy="no-referrer"]')) {
+      const src = img.getAttribute("src");
+      if (!src || seen.has(src)) continue;
+      if (/thumb/i.test(img.className) || img.closest('[class*="thumb"]')) continue;
+      if (/\/cover(_pc)?\./i.test(src) || /\/covers?\//i.test(src)) continue;
+      seen.add(src);
+      out.push(src);
+    }
+    return out;
+  }
   function isResolveIframe(name) {
     return name.startsWith(RESOLVE_IFRAME_NAME_PREFIX);
   }
@@ -313,16 +329,54 @@
       }
     }
     async resolveChapter(comic, chapterUrl, timeoutMs = 45e3) {
+      const gap = Date.now() - this.#lastLoadAt - RESOLVE_IFRAME_MIN_GAP_MS;
+      if (gap < 0) await new Promise((r) => setTimeout(r, -gap));
+      this.#lastLoadAt = Date.now();
       const src = `${buildReadPath(comic, chapterUrl)}?_myr=${Date.now().toString(36)}`;
-      const match = (ev2) => ev2.kind === "chapter-images" && ev2.chapterUrl === chapterUrl;
-      const ev = await this.#loadInIframe(src, this.#bus.token, match, timeoutMs);
-      if (ev.kind !== "chapter-images") throw new Error("unexpected-capture-event");
-      const siteId = ev.siteId ?? comic.siteId;
-      return {
-        chapterUrl,
-        images: ev.images.map((img) => finalizeImageUrl(siteId, img)),
-        resolvedAt: ev.capturedAt
-      };
+      const match = (ev) => ev.kind === "chapter-images" && ev.chapterUrl === chapterUrl;
+      const iframe = document.createElement("iframe");
+      iframe.name = `${RESOLVE_IFRAME_NAME_PREFIX}${this.#bus.token}`;
+      iframe.src = src;
+      iframe.setAttribute("aria-hidden", "true");
+      iframe.tabIndex = -1;
+      iframe.style.cssText = "position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;z-index:2147483647";
+      try {
+        document.documentElement.appendChild(iframe);
+        try {
+          const ev = await this.#bus.waitFor(match, Math.min(timeoutMs, CAPTURE_TIMEOUT_MS));
+          if (ev.kind !== "chapter-images") throw new Error("unexpected-capture-event");
+          const siteId = ev.siteId ?? comic.siteId;
+          return {
+            chapterUrl,
+            images: ev.images.map((img) => finalizeImageUrl(siteId, img)),
+            resolvedAt: ev.capturedAt
+          };
+        } catch (err) {
+          const scraped = await this.#pollIframeImages(iframe, SCRAPE_TIMEOUT_MS);
+          if (scraped.length > 0) {
+            return { chapterUrl, images: scraped, resolvedAt: Date.now() };
+          }
+          throw err;
+        }
+      } finally {
+        iframe.remove();
+      }
+    }
+    /** 轮询 iframe 文档中的阅读器图片（渲染需要时间）。 */
+    async #pollIframeImages(iframe, timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        try {
+          const doc = iframe.contentDocument;
+          if (doc) {
+            const imgs = scrapeReaderImages(doc);
+            if (imgs.length > 0) return imgs;
+          }
+        } catch {
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      return [];
     }
     async resolveComic(comic, seedChapterUrl, timeoutMs = 45e3) {
       const src = `${buildReadPath(comic, seedChapterUrl)}?_myr=${Date.now().toString(36)}`;
@@ -384,6 +438,13 @@
         return resolver.resolveComic(comic, seedChapterUrl);
       },
       async resolveChapter(comic, chapterUrl) {
+        const route = readRouteOf(new URL(location.href));
+        if (route && route.chapterUrl === chapterUrl) {
+          const imgs = scrapeReaderImages(document);
+          if (imgs.length > 0) {
+            return { chapterUrl, images: imgs, resolvedAt: Date.now() };
+          }
+        }
         return resolver.resolveChapter(comic, chapterUrl);
       },
       supportOf
@@ -594,15 +655,37 @@
       });
     }
     #installPageCapture() {
+      if (this.#tryInjectInline()) return;
+      if (!document.documentElement) {
+        const retry = () => {
+          if (!document.documentElement) return;
+          if (!this.#tryInjectInline()) this.#wrapUnsafeWindow();
+        };
+        if (document.readyState === "loading") {
+          document.addEventListener("readystatechange", retry, { once: true });
+          document.addEventListener("DOMContentLoaded", retry, { once: true });
+        } else {
+          retry();
+        }
+        return;
+      }
+      this.#wrapUnsafeWindow();
+    }
+    #tryInjectInline() {
       try {
+        const root = document.documentElement;
+        if (!root) return false;
         const el2 = document.createElement("script");
         el2.textContent = captureInjectSource(this.#token);
-        document.documentElement.appendChild(el2);
+        root.appendChild(el2);
         el2.remove();
-        const page2 = getUnsafeWindow();
-        if (!page2 || page2[PAGE_FLAG] === this.#token) return;
+        const page = getUnsafeWindow();
+        return !page || page[PAGE_FLAG] === this.#token;
       } catch {
+        return false;
       }
+    }
+    #wrapUnsafeWindow() {
       const page = getUnsafeWindow();
       if (!page || page[PAGE_FLAG] || !page.fetch) return;
       page[PAGE_FLAG] = this.#token;
@@ -818,6 +901,10 @@ ${comic.detailUrl}`)}`;
       this.#cache = mergeSettings(kv.get(KEY_SETTINGS));
     }
     get() {
+      return this.#cache;
+    }
+    reload() {
+      this.#cache = mergeSettings(this.#kv.get(KEY_SETTINGS));
       return this.#cache;
     }
     update(patch) {
@@ -1588,8 +1675,8 @@ ${comic.detailUrl}`)}`;
       this.content.appendChild(end);
     }
     makeEdgeCard(edge, label) {
-      const card = document.createElement("div");
-      card.className = "myr-edge-card myr-edge-card-h";
+      const card2 = document.createElement("div");
+      card2.className = "myr-edge-card myr-edge-card-h";
       const btn2 = document.createElement("button");
       btn2.type = "button";
       btn2.textContent = label;
@@ -1597,8 +1684,8 @@ ${comic.detailUrl}`)}`;
         e.stopPropagation();
         this.host.onChapterEdge(edge);
       });
-      card.appendChild(btn2);
-      return card;
+      card2.appendChild(btn2);
+      return card2;
     }
     /** 参考线 = 视口水平中线所在页与页内比例。 */
     computeAnchor() {
@@ -1622,7 +1709,7 @@ ${comic.detailUrl}`)}`;
     goTo(page, offset = 0) {
       if (!this.scroller) return;
       this.#applyLayout();
-      const slot = this.win.slots[clamp$1(page, 0, this.win.slots.length - 1)];
+      const slot = this.win.slots[clamp$2(page, 0, this.win.slots.length - 1)];
       if (!slot) return;
       const scrollerRect = this.scroller.getBoundingClientRect();
       const r = slot.getBoundingClientRect();
@@ -1631,7 +1718,7 @@ ${comic.detailUrl}`)}`;
       this.scroller.scrollBy({ left: r.left - desiredLeftInViewport });
     }
   }
-  function clamp$1(v, min, max) {
+  function clamp$2(v, min, max) {
     return Math.min(max, Math.max(min, v));
   }
   function clamp01$1(v) {
@@ -1846,8 +1933,8 @@ ${comic.detailUrl}`)}`;
       this.content.appendChild(end);
     }
     makeEdgeCard(edge, label) {
-      const card = document.createElement("div");
-      card.className = "myr-edge-card";
+      const card2 = document.createElement("div");
+      card2.className = "myr-edge-card";
       const btn2 = document.createElement("button");
       btn2.type = "button";
       btn2.textContent = label;
@@ -1855,8 +1942,8 @@ ${comic.detailUrl}`)}`;
         e.stopPropagation();
         this.host.onChapterEdge(edge);
       });
-      card.appendChild(btn2);
-      return card;
+      card2.appendChild(btn2);
+      return card2;
     }
     /** 参考线 = 视口垂直中线所在页与页内比例（R-K3）。 */
     computeAnchor() {
@@ -1878,7 +1965,7 @@ ${comic.detailUrl}`)}`;
       return { page, offset };
     }
     goTo(page, offset = 0) {
-      const slot = this.win.slots[clamp(page, 0, this.win.slots.length - 1)];
+      const slot = this.win.slots[clamp$1(page, 0, this.win.slots.length - 1)];
       if (!slot) return;
       const scrollerRect = this.scroller.getBoundingClientRect();
       const r = slot.getBoundingClientRect();
@@ -1887,7 +1974,7 @@ ${comic.detailUrl}`)}`;
       this.scroller.scrollTop += delta;
     }
   }
-  function clamp(v, min, max) {
+  function clamp$1(v, min, max) {
     return Math.min(max, Math.max(min, v));
   }
   function clamp01(v) {
@@ -1906,6 +1993,9 @@ ${comic.detailUrl}`)}`;
     #modeKind = "vertical";
     #active = false;
     #wakeLock = null;
+    #wakeLockPending = null;
+    #wakeLockGeneration = 0;
+    #downloadActive = false;
     #savedStyles = [];
     #savedScrollLock = null;
     constructor(deps) {
@@ -1943,12 +2033,14 @@ ${comic.detailUrl}`)}`;
     async enter(route) {
       if (this.#active) return;
       this.#active = true;
+      this.#deps.onActiveChange?.(true);
       this.#comic = route.comic;
       this.#chapterUrl = route.chapterUrl;
       this.#hideSiteReader();
       this.#lockScroll();
       this.#ui?.open();
       this.#applyBackground();
+      void this.requestWakeLock();
       const offInfo = this.#deps.adapter.onComicInfo((info) => {
         if (info.ref.siteId === this.#comic?.siteId && info.chapters.length) {
           this.#info = info;
@@ -2016,13 +2108,14 @@ ${comic.detailUrl}`)}`;
       this.#active = false;
       this.#unmountMode();
       this.#ui?.close();
-      this.#releaseWakeLock();
+      void this.requestWakeLock();
       this.#cleanup.run();
       this.#cleanup = new Cleanup();
       this.#restoreSiteReader();
       this.#restoreScroll();
       this.#pageState = null;
       this.#info = null;
+      this.#deps.onActiveChange?.(false);
     }
     #hideSiteReader() {
       this.#savedStyles = [];
@@ -2179,6 +2272,9 @@ ${comic.detailUrl}`)}`;
     // ---------- 键盘（R-C6） ----------
     handleKey(e) {
       if (!this.#active) return false;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return false;
+      const target = e.composedPath()[0] ?? e.target;
+      if (e.key !== "Escape" && (this.#ui?.hasOpenPanel?.() || target instanceof Element && target.matches('input, select, textarea, button, a, [contenteditable="true"]'))) return false;
       const rtl = this.settings.direction === "rtl";
       const forward = rtl ? "ArrowLeft" : "ArrowRight";
       const backward = rtl ? "ArrowRight" : "ArrowLeft";
@@ -2220,24 +2316,211 @@ ${comic.detailUrl}`)}`;
       }
     }
     #releaseWakeLock() {
-      void this.#wakeLock?.release().catch(() => {
-      });
+      this.#wakeLockGeneration++;
+      const sentinel = this.#wakeLock;
       this.#wakeLock = null;
+      void sentinel?.release().catch(() => {
+      });
+    }
+    #needsWakeLock() {
+      return this.settings.keepAwake && (this.#active || this.#downloadActive) && document.visibilityState !== "hidden";
+    }
+    setDownloadActive(active) {
+      if (this.#downloadActive === active) return;
+      this.#downloadActive = active;
+      void this.requestWakeLock();
     }
     async requestWakeLock() {
-      if (!this.settings.keepAwake) return;
-      if (this.#wakeLock && !this.#wakeLock.released) return;
-      try {
-        this.#wakeLock = await navigator.wakeLock.request("screen");
-        this.#wakeLock.addEventListener("release", () => {
-          this.#wakeLock = null;
-        });
-      } catch {
+      if (!this.#needsWakeLock()) {
+        this.#releaseWakeLock();
+        return;
       }
+      if (typeof navigator.wakeLock?.request !== "function") return;
+      if (this.#wakeLock && !this.#wakeLock.released) return;
+      if (this.#wakeLockPending) return this.#wakeLockPending;
+      const generation = this.#wakeLockGeneration;
+      const pending = Promise.resolve().then(async () => {
+        try {
+          const sentinel = await navigator.wakeLock.request("screen");
+          if (generation !== this.#wakeLockGeneration || !this.#needsWakeLock()) {
+            await sentinel.release();
+            return;
+          }
+          this.#wakeLock = sentinel;
+          sentinel.addEventListener("release", () => {
+            if (this.#wakeLock === sentinel) this.#wakeLock = null;
+          });
+        } catch {
+        }
+      }).finally(() => {
+        if (this.#wakeLockPending === pending) this.#wakeLockPending = null;
+        if (generation !== this.#wakeLockGeneration && this.#needsWakeLock()) void this.requestWakeLock();
+      });
+      this.#wakeLockPending = pending;
+      return pending;
     }
   }
+  const SETTINGS_STYLES = `
+.myr-settings-wrap {
+  background: #050a1499; backdrop-filter: blur(8px);
+  padding: max(12px, env(safe-area-inset-top)) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+.myr-sheet.myr-settings {
+  width: 100%; max-width: 640px; height: min(88dvh, 860px);
+  max-height: calc(100dvh - max(12px, env(safe-area-inset-top)));
+  padding: 0; overflow: hidden; border: 1px solid #5e739444;
+  border-bottom: 0; border-radius: 26px 26px 0 0;
+  background: linear-gradient(155deg, #202c3e 0, var(--myr-ink) 250px);
+  box-shadow: 0 -18px 70px #0005;
+  color: var(--myr-text); color-scheme: dark;
+  font-family: "MiSans", "HarmonyOS Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px; line-height: 1.5;
+  animation: myr-settings-in .2s ease-out both;
+}
+.myr-settings h2, .myr-settings h3, .myr-settings p { margin: 0 }
+.myr-sheet-grip { flex-shrink: 0; width: 34px; height: 4px; margin: 9px auto 0; border-radius: 4px; background: #a4b7d045 }
+.myr-settings-header { display: flex; align-items: center; gap: 12px; padding: 17px 20px 18px; flex-shrink: 0 }
+.myr-settings-mark {
+  width: 43px; height: 43px; display: grid; place-items: center; flex: 0 0 auto;
+  background: linear-gradient(140deg, #9fc3ff24, #9fc3ff06); color: var(--myr-accent);
+  border: 1px solid #9fc3ff38; border-radius: 14px;
+}
+.myr-settings-mark .myr-icon { width: 25px; height: 25px }
+.myr-settings-heading { flex: 1; min-width: 0 }
+.myr-settings .myr-eyebrow { display: block; font-size: 9px; font-weight: 700; letter-spacing: .16em; color: var(--myr-accent); margin-bottom: 3px }
+.myr-settings h2 { font-size: 22px; font-weight: 650; letter-spacing: .02em; line-height: 1.35 }
+.myr-settings .myr-icon-button { padding: 0; width: 48px; height: 48px; display: grid; place-items: center; background: #ffffff05 }
+.myr-settings .myr-btn, .myr-settings .myr-select {
+  min-height: 48px; min-width: 48px; border-color: var(--myr-line);
+  font: inherit; color: var(--myr-text); background: #202a39; border-radius: 12px;
+}
+.myr-settings .myr-btn { padding: 0 14px; touch-action: manipulation }
+.myr-settings .myr-btn:hover { background: #2c394d }
+.myr-settings .myr-btn:active { background: #354962 }
+.myr-settings .myr-btn-primary { color: #12233e; background: var(--myr-accent); border-color: transparent; font-weight: 650 }
+.myr-settings .myr-btn-primary:hover { background: #bed6ff }
+.myr-settings .myr-btn:disabled { opacity: .3; cursor: default }
+.myr-settings :is(button, input, select):focus-visible { outline: 3px solid var(--myr-accent); outline-offset: 3px }
+.myr-settings-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; margin: 0 20px 16px; padding: 4px; border: 1px solid #4b5c7433; border-radius: 16px; background: #0a101b70; flex-shrink: 0 }
+.myr-settings-tab { min-height: 48px; min-width: 48px; padding: 0 12px; border: 0; border-radius: 11px; background: transparent; color: var(--myr-muted); font: inherit; font-weight: 600; cursor: pointer }
+.myr-settings-tab[aria-selected="true"] { background: #344e72; color: #edf4ff; box-shadow: 0 2px 6px #0002, inset 0 1px 0 #a5c8ff25 }
+.myr-settings-body { min-height: 0; padding: 0; border-top: 1px solid #819cc21c; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #40516b transparent }
+.myr-settings-content { display: flex; flex-direction: column; gap: 16px; padding: 20px }
+.myr-section-caption { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 600; color: #b9c9df }
+.myr-scope-tag { font-size: 10px; font-weight: 500; padding: 3px 8px; border-radius: 6px; background: #8fa9d013; color: #9daec6 }
+.myr-mode-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: -6px }
+.myr-mode-card {
+  min-height: 104px; min-width: 0; padding: 14px 6px 12px; cursor: pointer;
+  border: 1px solid #344052; border-radius: 15px; background: #1e2836;
+  color: #b4c2d5; display: flex; flex-direction: column; align-items: center; gap: 5px; font: inherit;
+}
+.myr-mode-card > .myr-icon { margin-bottom: 3px; width: 25px; height: 25px }
+.myr-mode-card[aria-pressed="true"] { color: #dbeaff; border-color: #9fc3ff; background: linear-gradient(150deg, #385478, #24394f); box-shadow: inset 0 0 0 1px #9fc3ff20 }
+.myr-mode-name { font-size: 13px; font-weight: 650 }
+.myr-mode-note { font-size: 10px; color: #9fb3cd }
+.myr-settings-card { padding: 16px; border: 1px solid #8a9cbb1c; border-radius: 17px; background: #202a387a }
+.myr-card-heading { margin-bottom: 14px }
+.myr-settings h3 { font-size: 15px; font-weight: 650; color: #edf3fc; margin-bottom: 4px }
+.myr-setting-hint { display: block; font-size: 12px; font-weight: 400; line-height: 1.65; color: var(--myr-muted); overflow-wrap: anywhere }
+.myr-setting-title { display: block; font-size: 13px; line-height: 1.5; font-weight: 550; color: #e5ecf6 }
+.myr-setting-segments { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px }
+.myr-settings .myr-setting-choice { padding: 8px 5px; min-width: 0; font-size: 12px }
+.myr-settings .myr-setting-choice[aria-pressed="true"] { color: #d5e7ff; border-color: #94b9f0; background: #354c6a }
+.myr-setting-segments.myr-two-columns { grid-template-columns: repeat(2, minmax(0, 1fr)) }
+.myr-setting-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; min-height: 64px; padding: 12px 0; cursor: pointer }
+.myr-setting-row + .myr-setting-row, .myr-setting-segments + .myr-setting-row { border-top: 1px solid #8a9cbb1c }
+.myr-setting-segments + .myr-setting-row { margin-top: 14px; padding-bottom: 0 }
+.myr-card-heading + .myr-setting-row { padding-top: 0 }
+.myr-setting-row:last-child { padding-bottom: 0 }
+.myr-setting-copy { flex: 1; min-width: 0 }
+.myr-setting-copy .myr-setting-hint { margin-top: 3px }
+.myr-switch { position: relative; width: 52px; height: 48px; flex: 0 0 52px }
+.myr-switch input { position: absolute; inset: 0; width: 52px; height: 48px; margin: 0; opacity: 0; cursor: pointer; z-index: 1 }
+.myr-switch-track { position: absolute; top: 10px; left: 2px; width: 48px; height: 28px; border-radius: 18px; background: #435066; pointer-events: none }
+.myr-switch-track::after { content: ''; position: absolute; top: 4px; left: 4px; width: 20px; height: 20px; border-radius: 50%; background: #d3deee }
+.myr-switch input:checked + .myr-switch-track { background: var(--myr-accent) }
+.myr-switch input:checked + .myr-switch-track::after { transform: translateX(20px); background: #1b3150 }
+.myr-switch input:focus-visible + .myr-switch-track { outline: 3px solid var(--myr-accent); outline-offset: 4px }
+.myr-width-control { display: flex; align-items: center; gap: 16px }
+.myr-width-slider { width: 100%; flex: 1; min-width: 0; height: 48px; margin: 0; accent-color: var(--myr-accent); cursor: pointer }
+.myr-width-value { min-width: 59px; padding: 6px 8px; text-align: center; border-radius: 9px; background: #9fc3ff14; color: #c1d9ff; font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums }
+.myr-range-legend { display: flex; justify-content: space-between; padding-right: 76px; font-size: 10px; color: #8d9db4 }
+.myr-backgrounds { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px }
+.myr-settings .myr-backgrounds .myr-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; padding: 12px 2px; font-size: 11px }
+.myr-color-swatch { width: 24px; height: 24px; border-radius: 50%; border: 1px solid #8195b0; display: block }
+.myr-swatch-black { background: #000 }
+.myr-swatch-gray { background: #3f3f46 }
+.myr-swatch-white { background: #f5f5f4 }
+.myr-swatch-system { background: linear-gradient(90deg, #e9eef5 50%, #15202e 50%) }
+.myr-settings .myr-settings-note { text-align: center; color: #8b9bb1; font-size: 11px; line-height: 1.7; padding: 0 8px }
+.myr-stepper-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0 }
+.myr-stepper-row + .myr-stepper-row { border-top: 1px solid #8a9cbb1c }
+.myr-stepper { display: flex; align-items: center; gap: 3px; flex: 0 0 auto }
+.myr-settings .myr-stepper-button { width: 48px; height: 48px; padding: 0; font-size: 21px; font-weight: 400; background: #121b28 }
+.myr-stepper-value { min-width: 32px; text-align: center; font-variant-numeric: tabular-nums; font-size: 16px }
+.myr-settings .myr-text-button { flex: 0 0 auto; font-size: 12px; padding: 0 10px; color: var(--myr-accent); background: #9fc3ff0b }
+.myr-backup-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px }
+.myr-backup-actions .myr-btn { justify-content: center }
+.myr-settings .myr-file-label { min-height: 50px }
+.myr-file-label:focus-within { outline: 3px solid var(--myr-accent); outline-offset: 3px }
+.myr-zone-editor { display: grid; grid-template-columns: 124px minmax(0, 1fr); align-items: center; gap: 18px; margin: 16px 0 20px }
+.myr-settings .myr-zone-preview { width: 124px; margin: 0; border-radius: 15px; border: 1px solid #536981; box-shadow: 0 6px 14px #0002 }
+.myr-settings .myr-zone { background: #24334a; border-color: #354d6d; color: #c8d9f0; font-size: 10px }
+.myr-settings .myr-zone-center { color: #17263e; background: #9fc3ff; font-weight: 650 }
+.myr-zone-mappings { display: flex; flex-direction: column; gap: 8px; min-width: 0 }
+.myr-zone-mapping { display: flex; align-items: center; gap: 8px; min-width: 0 }
+.myr-zone-mapping > span { font-size: 12px; color: var(--myr-muted) }
+.myr-zone-mapping .myr-select { width: 100%; min-width: 0; font-size: 12px; padding: 0 6px; background: #15202e }
+.myr-preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px }
+.myr-settings .myr-preset-grid .myr-btn, .myr-settings .myr-setting-tools .myr-btn { padding: 0 6px; font-size: 12px }
+.myr-setting-tools { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 12px }
+.myr-gesture-note { display: flex; gap: 12px; align-items: center; padding: 0 6px; color: #8fa7c8 }
+.myr-gesture-note p { font-size: 11px; line-height: 1.8 }
+.myr-gesture-note .myr-icon { width: 24px; height: 24px }
+.myr-settings-footer { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 20px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid #8a9cbb20; background: #172130; flex: 0 0 auto }
+.myr-saved-indicator { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #a9bbd4 }
+.myr-saved-indicator .myr-icon { width: 16px; height: 16px; color: var(--myr-accent) }
+.myr-settings-footer .myr-btn { min-width: 96px }
+@keyframes myr-settings-in { from { opacity: 0; transform: translateY(14px) } to { opacity: 1; transform: translateY(0) } }
+@media (min-width: 768px) {
+  .myr-settings-wrap { align-items: center; padding: 24px }
+  .myr-sheet.myr-settings { height: min(840px, calc(100dvh - 48px)); max-height: calc(100dvh - 48px); border-radius: 24px; border-bottom: 1px solid #5e739444; box-shadow: 0 30px 100px #0007 }
+  .myr-settings .myr-sheet-grip { display: none }
+  .myr-settings-header { padding-top: 22px }
+}
+@media (max-width: 374px) {
+  .myr-settings-content { padding: 16px }
+  .myr-settings-card { padding: 14px }
+  .myr-zone-editor { grid-template-columns: 112px minmax(0, 1fr); gap: 12px }
+  .myr-settings .myr-zone-preview { width: 112px }
+  .myr-settings-header { padding-inline: 16px }
+  .myr-settings-tabs { margin-inline: 16px }
+}
+@media (max-height: 500px) {
+  .myr-sheet.myr-settings { height: calc(100dvh - 12px); max-height: calc(100dvh - 12px) }
+  .myr-settings-header { padding-block: 8px }
+  .myr-settings .myr-eyebrow, .myr-settings .myr-sheet-grip { display: none }
+  .myr-settings-tabs { margin-bottom: 8px }
+  .myr-settings-footer { padding-block: 8px }
+}
+@media (prefers-reduced-motion: reduce) {
+  .myr-settings, .myr-entry { animation: none !important; transition: none !important }
+}
+`;
   const STYLES = `
-:host { all: initial }
+:host {
+  all: initial;
+  --myr-ink: #11151e;
+  --myr-panel: #1b2230;
+  --myr-card: #232c3b;
+  --myr-line: #344052;
+  --myr-text: #eef3fa;
+  --myr-muted: #a0afc3;
+  --myr-accent: #9fc3ff;
+}
+*, *::before, *::after { box-sizing: border-box }
+[hidden] { display: none !important }
+.myr-icon { display: block; width: 22px; height: 22px; flex: 0 0 auto }
 
 .myr-root {
   position: fixed; inset: 0;
@@ -2250,7 +2533,7 @@ ${comic.detailUrl}`)}`;
 .myr-bg-black { background: #000 }
 .myr-bg-gray { background: #3f3f46 }
 .myr-bg-white { background: #fff }
-.myr-bg-system { background: light-dark(#fff, #000) }
+.myr-bg-system { color-scheme: light dark; background: light-dark(#fff, #000) }
 
 /* ---------- 阅读模式 ---------- */
 .myr-mode-root { position: absolute; inset: 0; overflow: hidden }
@@ -2379,7 +2662,7 @@ ${comic.detailUrl}`)}`;
 }
 .myr-btn:active { background: #333338 }
 .myr-btn-primary { background: #2f6fed; border-color: #2f6fed; color: #fff }
-.myr-btn-small { min-width: 40px; min-height: 40px; padding: 0 10px; font-size: 13px }
+.myr-btn-small { min-width: 48px; min-height: 48px; padding: 0 10px; font-size: 13px }
 .myr-seg-active { background: #3a5bcc; border-color: #5a78e0; color: #fff }
 .myr-title {
   flex: 1; text-align: center; font-size: 15px;
@@ -2504,41 +2787,434 @@ ${comic.detailUrl}`)}`;
 
 /* ---------- 悬浮入口（R-C1） ---------- */
 .myr-entry {
-  position: fixed; z-index: 2147483646;
-  min-width: 52px; min-height: 52px; border-radius: 26px;
-  border: 1px solid rgba(255, 255, 255, .35);
-  background: rgba(20, 20, 24, .82); color: #fff;
-  font-size: 13px; display: flex; align-items: center; justify-content: center;
-  padding: 0 14px; cursor: pointer; user-select: none;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, .4);
-  touch-action: none;
+  position: relative; width: 52px; height: 52px; padding: 0;
+  border-radius: 18px; border: 1px solid rgba(174, 203, 244, .4);
+  background: linear-gradient(145deg, #2c405c, #152030 75%); color: #d8e8ff;
+  display: grid; place-items: center; cursor: grab; user-select: none;
+  -webkit-tap-highlight-color: transparent; touch-action: none;
+  box-shadow: 0 6px 20px #02091240, inset 0 1px 0 #ffffff16;
+  transition: background .18s ease, box-shadow .18s ease;
 }
+.myr-entry .myr-icon { width: 27px; height: 27px }
+.myr-entry::after {
+  content: ''; position: absolute; right: 7px; top: 7px;
+  width: 4px; height: 4px; border-radius: 50%; background: #adcbff;
+}
+.myr-entry:hover { background: linear-gradient(145deg, #3b5476, #1b293e 75%) }
+.myr-entry:active, .myr-entry-dragging { cursor: grabbing; box-shadow: 0 8px 26px #02091265 }
+.myr-entry:focus-visible { outline: 3px solid #9fc3ff; outline-offset: 4px }
+${SETTINGS_STYLES}
 `;
+  function h(tag, attrs, ...children) {
+    const el2 = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs ?? {})) {
+      if (key.startsWith("on") && typeof value === "function") {
+        el2.addEventListener(key.slice(2), value);
+      } else if (typeof value === "boolean") {
+        if (value) el2.setAttribute(key, "");
+      } else {
+        el2.setAttribute(key, String(value));
+      }
+    }
+    for (const child of children) {
+      if (child != null) el2.append(child instanceof Node ? child : document.createTextNode(child));
+    }
+    return el2;
+  }
+  const version = "1.1.1";
+  const PATHS = {
+    book: "M12 5.5C9 3.8 5.5 3.5 3 4.5v14c3-1 6.5-.5 9 1 2.5-1.5 6-2 9-1v-14c-2.5-1-6-.7-9 1Zm0 0v14M6 8l3 .5M6 11l3 .5M15 8.5l3-.5M15 11.5l3-.5",
+    vertical: "M5 3h14v5H5zM5 12h14v5H5zM9 21h6",
+    horizontal: "M3 5h5v14H3zM12 5h5v14h-5zM21 9v6",
+    single: "M5 3h14v18H5zM9 7h6M9 11h6",
+    close: "m6 6 12 12M18 6 6 18",
+    check: "m5 12 4 4L19 6",
+    download: "M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5",
+    sliders: "M4 7h7m4 0h5M4 17h3m4 0h9M11 4v6M7 14v6",
+    gesture: "M8 12V5a2 2 0 0 1 4 0v6-3a2 2 0 0 1 4 0v4-1a2 2 0 0 1 4 0v5c0 4-3 6-6 6h-1c-2 0-3-1-4-2l-5-6a2 2 0 0 1 3-2l2 2"
+  };
+  function icon(name) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    for (const [key, value] of Object.entries({
+      viewBox: "0 0 24 24",
+      fill: "none",
+      stroke: "currentColor",
+      "stroke-width": "1.7",
+      "stroke-linecap": "round",
+      "stroke-linejoin": "round",
+      "aria-hidden": "true",
+      focusable: "false"
+    })) svg.setAttribute(key, value);
+    svg.classList.add("myr-icon");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", PATHS[name]);
+    svg.append(path);
+    return svg;
+  }
+  function button(label, action, className = "myr-btn") {
+    return h("button", { class: className, type: "button", onclick: action }, label);
+  }
+  function card(title, description, ...content) {
+    return h(
+      "section",
+      { class: "myr-settings-card" },
+      h(
+        "div",
+        { class: "myr-card-heading" },
+        h("h3", {}, title),
+        h("p", { class: "myr-setting-hint" }, description)
+      ),
+      ...content
+    );
+  }
+  function segmented(label, values, current, setter, className = "") {
+    const row = h("div", { class: `myr-setting-segments ${className}`, role: "group", "aria-label": label });
+    for (const [value, text] of values) {
+      const item = button(text, () => {
+        setter(value);
+        for (const option of row.querySelectorAll("button")) {
+          option.setAttribute("aria-pressed", String(option === item));
+        }
+      }, "myr-btn myr-setting-choice");
+      item.dataset.value = value;
+      item.setAttribute("aria-pressed", String(value === current));
+      row.append(item);
+    }
+    return row;
+  }
+  function toggle(label, description, on, setter) {
+    const input = h("input", { type: "checkbox", role: "switch", "aria-label": label });
+    input.checked = on;
+    input.addEventListener("change", () => setter(input.checked));
+    return h(
+      "label",
+      { class: "myr-setting-row" },
+      h(
+        "span",
+        { class: "myr-setting-copy" },
+        h("span", { class: "myr-setting-title" }, label),
+        h("span", { class: "myr-setting-hint" }, description)
+      ),
+      h("span", { class: "myr-switch" }, input, h("span", { class: "myr-switch-track", "aria-hidden": "true" }))
+    );
+  }
+  function stepper(label, title, initial, min, max, setter) {
+    let current = initial;
+    const value = h("output", { class: "myr-stepper-value", "aria-live": "polite" }, String(current));
+    const change = (delta) => {
+      current = Math.min(max, Math.max(min, current + delta));
+      value.textContent = String(current);
+      setter(current);
+      update();
+    };
+    const minus = button("−", () => change(-1), "myr-btn myr-stepper-button");
+    minus.setAttribute("aria-label", `减少${label}`);
+    const plus = button("+", () => change(1), "myr-btn myr-stepper-button");
+    plus.setAttribute("aria-label", `增加${label}`);
+    const update = () => {
+      minus.disabled = current <= min;
+      plus.disabled = current >= max;
+    };
+    update();
+    return h(
+      "div",
+      { class: "myr-stepper-row", role: "group", "aria-label": label },
+      h("span", { class: "myr-setting-title" }, title),
+      h("div", { class: "myr-stepper" }, minus, value, plus)
+    );
+  }
+  function readingPanel(actions) {
+    const s = actions.settings();
+    const modes = [
+      ["vertical", "纵向连续", "长条 / 韩漫", "vertical"],
+      ["horizontal", "横向连续", "跨页 / 日漫", "horizontal"],
+      ["single", "单页阅读", "逐页细读", "single"]
+    ];
+    const modeRow = h("div", { class: "myr-mode-cards", role: "group", "aria-label": "阅读模式" });
+    const modeControls = h("div", { class: "myr-mode-settings" });
+    const renderMode = () => {
+      const settings = actions.settings();
+      modeControls.replaceChildren();
+      if (settings.mode === "vertical") {
+        const input = h("input", { class: "myr-width-slider", type: "range", min: "50", max: "100", step: "10", "aria-label": "阅读宽度" });
+        input.value = String(settings.verticalWidth);
+        const value = h("output", { class: "myr-width-value" }, `${settings.verticalWidth}%`);
+        input.addEventListener("input", () => {
+          value.textContent = `${input.value}%`;
+        });
+        input.addEventListener("change", () => actions.setVerticalWidth(Number(input.value)));
+        modeControls.append(card(
+          "阅读宽度",
+          "只对当前漫画生效，图片始终居中、不裁切。",
+          h("div", { class: "myr-width-control" }, input, value),
+          h("div", { class: "myr-range-legend", "aria-hidden": "true" }, h("span", {}, "留白更多"), h("span", {}, "铺满屏幕"))
+        ));
+      } else if (settings.mode === "horizontal") {
+        modeControls.append(card(
+          "横向适配",
+          "自动：竖屏整页可见，横屏按高度连续排列。",
+          segmented("横向适配", [["auto", "自动"], ["screen", "适应屏幕"], ["height", "适应高度"]], settings.horizontalFit, actions.setHorizontalFit),
+          toggle("页间留隙", "适应屏幕时保留 12px 留白；跨页拼接请关闭。", settings.horizontalGap !== false, actions.setHorizontalGap)
+        ));
+      } else {
+        modeControls.append(card(
+          "单页适应",
+          "为当前漫画选择页面大小，默认完整显示一页。",
+          segmented("单页适应", [["screen", "适应屏幕"], ["width", "适应宽度"], ["height", "适应高度"], ["original", "原始大小"]], settings.singleFit, actions.setSingleFit, "myr-two-columns")
+        ));
+      }
+    };
+    for (const [kind, label, note, glyph] of modes) {
+      const item = h("button", {
+        class: "myr-mode-card",
+        type: "button",
+        "aria-label": label,
+        "aria-pressed": String(kind === s.mode)
+      }, icon(glyph), h("span", { class: "myr-mode-name" }, label), h("span", { class: "myr-mode-note" }, note));
+      item.addEventListener("click", () => {
+        actions.switchMode(kind);
+        for (const option of modeRow.querySelectorAll("button")) option.setAttribute("aria-pressed", String(option === item));
+        renderMode();
+      });
+      modeRow.append(item);
+    }
+    renderMode();
+    const backgrounds = segmented(
+      "阅读背景",
+      [["black", "纯黑"], ["gray", "深灰"], ["white", "纸白"], ["system", "跟随系统"]],
+      s.background,
+      actions.setBackground,
+      "myr-backgrounds"
+    );
+    for (const item of backgrounds.querySelectorAll("button")) {
+      item.prepend(h("span", { class: `myr-color-swatch myr-swatch-${item.dataset.value}`, "aria-hidden": "true" }));
+    }
+    return h(
+      "div",
+      { class: "myr-settings-content" },
+      h("div", { class: "myr-section-caption" }, h("span", {}, "选择阅读方式"), h("span", { class: "myr-scope-tag" }, "本书记忆")),
+      modeRow,
+      modeControls,
+      card("阅读背景", "全局通用。留白区域跟随选择，不改变漫画图片。", backgrounds),
+      h("p", { class: "myr-settings-note" }, "左右阅读方向可在阅读工具栏切换。")
+    );
+  }
+  function gesturesPanel(options) {
+    const { actions } = options;
+    const settings = actions.settings();
+    let zones = { ...settings.tapZones };
+    const labels = { prev: "上一页", next: "下一页", none: "无操作" };
+    const names = [["top", "上"], ["left", "左"], ["right", "右"], ["bottom", "下"]];
+    const preview = h("div", { class: "myr-zone-preview", role: "img", "aria-label": "点击区布局：中央固定为菜单" });
+    const mappings = h("div", { class: "myr-zone-mappings" });
+    const selects = /* @__PURE__ */ new Map();
+    const renderPreview = () => {
+      const zone = (name, text) => h("div", { class: `myr-zone myr-zone-${name}` }, text);
+      preview.replaceChildren(
+        zone("top", labels[zones.top]),
+        h("div", { class: "myr-zone-mid" }, zone("left", labels[zones.left]), zone("center", "菜单"), zone("right", labels[zones.right])),
+        zone("bottom", labels[zones.bottom])
+      );
+      preview.setAttribute("aria-label", `点击区布局：上${labels[zones.top]}，左${labels[zones.left]}，右${labels[zones.right]}，下${labels[zones.bottom]}，中央菜单`);
+    };
+    const apply = (next) => {
+      zones = { ...next };
+      for (const [name, select] of selects) select.value = zones[name];
+      renderPreview();
+      actions.setTapZones({ ...zones });
+    };
+    for (const [name, label] of names) {
+      const select = h("select", { class: "myr-select", "data-zone": name, "aria-label": `${label}方点击区` });
+      for (const [value, text] of Object.entries(labels)) select.append(h("option", { value }, text));
+      select.value = zones[name];
+      select.addEventListener("change", () => apply({ ...zones, [name]: select.value }));
+      selects.set(name, select);
+      mappings.append(h("label", { class: "myr-zone-mapping" }, h("span", {}, label), select));
+    }
+    renderPreview();
+    const presets = h("div", { class: "myr-preset-grid", role: "group", "aria-label": "点击区预设" });
+    for (const preset of Object.values(TAP_PRESETS)) presets.append(button(preset.label, () => apply(preset.zones)));
+    return h(
+      "div",
+      { class: "myr-settings-content" },
+      card(
+        "让翻页顺手一点",
+        "四周由你定义，中央始终呼出菜单。设置对所有漫画生效。",
+        h("div", { class: "myr-zone-editor" }, preview, mappings),
+        h("div", { class: "myr-section-caption" }, "快速预设"),
+        presets,
+        h(
+          "div",
+          { class: "myr-setting-tools" },
+          button("反转左右", () => apply(invertHorizontalZones(zones))),
+          button("恢复默认", () => apply(TAP_PRESETS.default.zones)),
+          button("立即试用", () => {
+            options.onClose();
+            options.toast("已应用，点击试用");
+          }, "myr-btn myr-btn-primary")
+        )
+      ),
+      card(
+        "连续阅读",
+        "关闭点击翻页后，轻点只会呼出菜单。",
+        toggle("连续模式点击区", "在纵向和横向连续模式中使用同一套点击区。", settings.tapInContinuous, actions.setTapInContinuous)
+      ),
+      h("div", { class: "myr-gesture-note" }, icon("gesture"), h("p", {}, "双指放大后，拖动只移动画面；缩放结束后会短暂屏蔽误触。"))
+    );
+  }
+  function generalPanel(options) {
+    const { actions } = options;
+    const settings = actions.settings();
+    const importInput = h("input", { type: "file", accept: "application/json,.json", "aria-label": "导入设置" });
+    importInput.addEventListener("change", async () => {
+      const file = importInput.files?.[0];
+      if (!file) return;
+      try {
+        const result = actions.importSettings(await file.text());
+        options.toast(result.ok ? "导入成功，设置已应用" : `导入失败：${result.error ?? "未知错误"}`);
+        if (result.ok) options.onClose();
+      } catch {
+        options.toast("导入失败：无法读取文件");
+      } finally {
+        importInput.value = "";
+      }
+    });
+    const exportButton = button("导出设置", () => {
+      const blob = new Blob([actions.exportSettings()], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = h("a", { href: url, download: "mangayun-reader-settings.json" });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1e3);
+    });
+    return h(
+      "div",
+      { class: "myr-settings-content" },
+      card(
+        "流畅与性能",
+        "提前加载相邻图片。窗口越大，占用的内存越多。",
+        stepper("前方预加载", "当前页之前", settings.preload.before, 0, 5, (value) => actions.setPreload(value, actions.settings().preload.after)),
+        stepper("后方预加载", "当前页之后", settings.preload.after, 1, 10, (value) => actions.setPreload(actions.settings().preload.before, value)),
+        stepper("下载并发", "同时下载图片", settings.download.concurrency, 1, 4, actions.setDownloadConcurrency)
+      ),
+      card(
+        "阅读习惯",
+        "这些偏好全局生效，下一次打开时仍会保留。",
+        toggle("屏幕常亮", "阅读和下载时尝试保持亮屏；由浏览器能力决定。", settings.keepAwake, actions.setKeepAwake),
+        toggle("自动进入增强阅读", "进入原站阅读页后，直接打开增强阅读器。", settings.autoEnter, actions.setAutoEnter),
+        h(
+          "div",
+          { class: "myr-setting-row" },
+          h("div", { class: "myr-setting-copy" }, h("span", { class: "myr-setting-title" }, "悬浮入口"), h("span", { class: "myr-setting-hint" }, "退出阅读后显示，拖动后自动贴边。")),
+          button("重置入口位置", () => {
+            actions.resetEntryPosition();
+            options.toast("入口位置已重置，退出阅读后生效");
+          }, "myr-btn myr-text-button")
+        )
+      ),
+      card(
+        "备份与迁移",
+        "导出设置和本地阅读进度，不包含漫画图片。",
+        h("div", { class: "myr-backup-actions" }, exportButton, h("label", { class: "myr-btn myr-file-label" }, "导入设置", importInput))
+      ),
+      h("p", { class: "myr-settings-note" }, `MangaYun Reader ${version} · 数据仅保存在本地`)
+    );
+  }
+  function createSettingsPanel(options) {
+    const tabs = [
+      ["reading", "阅读", () => readingPanel(options.actions)],
+      ["gestures", "手势", () => gesturesPanel(options)],
+      ["general", "通用", () => generalPanel(options)]
+    ];
+    const close = h("button", { class: "myr-btn myr-icon-button", type: "button", "aria-label": "关闭设置", onclick: options.onClose }, icon("close"));
+    const tabRow = h("div", { class: "myr-settings-tabs", role: "tablist", "aria-label": "设置分类" });
+    const body = h("div", { class: "myr-sheet-body myr-settings-body" });
+    const buttons = [];
+    const panels = [];
+    const activate = (index, focus = false) => {
+      for (const [i, tab] of buttons.entries()) {
+        tab.setAttribute("aria-selected", String(i === index));
+        tab.tabIndex = i === index ? 0 : -1;
+        panels[i].hidden = i !== index;
+      }
+      body.scrollTop = 0;
+      if (focus) buttons[index].focus();
+    };
+    for (const [index, [id, label, render]] of tabs.entries()) {
+      const tab = button(label, () => activate(index), "myr-settings-tab");
+      tab.id = `myr-settings-tab-${id}`;
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-controls", `myr-settings-panel-${id}`);
+      tab.addEventListener("keydown", (event) => {
+        let next;
+        if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+        if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+        if (event.key === "Home") next = 0;
+        if (event.key === "End") next = tabs.length - 1;
+        if (next !== void 0) {
+          event.preventDefault();
+          activate(next, true);
+        }
+      });
+      const panel = h("div", { id: `myr-settings-panel-${id}`, role: "tabpanel", "aria-labelledby": tab.id }, render());
+      buttons.push(tab);
+      panels.push(panel);
+      tabRow.append(tab);
+      body.append(panel);
+    }
+    activate(0);
+    const dialog = h(
+      "div",
+      { class: "myr-sheet myr-settings", role: "dialog", "aria-modal": "true", "aria-label": "阅读设置" },
+      h("div", { class: "myr-sheet-grip", "aria-hidden": "true" }),
+      h(
+        "div",
+        { class: "myr-settings-header" },
+        h("div", { class: "myr-settings-mark" }, icon("book")),
+        h("div", { class: "myr-settings-heading" }, h("span", { class: "myr-eyebrow" }, "MANGAYUN READER"), h("h2", {}, "阅读设置")),
+        close
+      ),
+      tabRow,
+      body,
+      h(
+        "div",
+        { class: "myr-settings-footer" },
+        h("span", { class: "myr-saved-indicator" }, icon("check"), "更改自动保存"),
+        button("完成", options.onClose, "myr-btn myr-btn-primary")
+      )
+    );
+    dialog.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        options.onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = [...dialog.querySelectorAll("button:not([disabled]), input:not([disabled]), select:not([disabled])")].filter((el2) => !el2.closest("[hidden]") && el2.tabIndex >= 0);
+      const active = dialog.getRootNode().activeElement;
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    });
+    const wrap = h("div", { class: "myr-sheet-wrap myr-settings-wrap" }, dialog);
+    wrap.addEventListener("click", (event) => {
+      if (event.target === wrap) options.onClose();
+    });
+    return wrap;
+  }
   const BG_COLOR = {
     black: "#000",
     gray: "#3f3f46",
     white: "#fff",
     system: "auto"
   };
-  function h(tag, attrs, ...children) {
-    const el2 = document.createElement(tag);
-    if (attrs) {
-      for (const [key, value] of Object.entries(attrs)) {
-        if (key.startsWith("on") && typeof value === "function") {
-          el2.addEventListener(key.slice(2), value);
-        } else if (typeof value === "boolean") {
-          if (value) el2.setAttribute(key, "");
-        } else {
-          el2.setAttribute(key, String(value));
-        }
-      }
-    }
-    for (const child of children) {
-      if (child == null) continue;
-      el2.append(child instanceof Node ? child : document.createTextNode(child));
-    }
-    return el2;
-  }
   class OverlayUI {
     #host;
     #shadow;
@@ -2577,12 +3253,16 @@ ${comic.detailUrl}`)}`;
       this.#pageSlider = this.#toolbar.querySelector(".myr-page-slider");
       this.#root.append(this.#modeRootEl, this.#toolbar);
       this.#shadow.append(this.#root);
+    }
+    #bindEvents() {
+      this.#cleanup = new Cleanup();
       this.#cleanup.addListener(this.#root, "pointerdown", (e) => e.stopPropagation());
       this.#cleanup.addListener(this.#root, "touchstart", (e) => e.stopPropagation(), { passive: true });
       this.#cleanup.addListener(this.#root, "touchmove", (e) => e.stopPropagation(), { passive: true });
       this.#cleanup.addListener(this.#root, "touchend", (e) => e.stopPropagation(), { passive: true });
       this.#cleanup.addListener(this.#root, "click", (e) => e.stopPropagation());
       this.#cleanup.addListener(this.#root, "wheel", (e) => e.stopPropagation());
+      this.#cleanup.addListener(this.#root, "keydown", (e) => e.stopPropagation());
     }
     get modeRoot() {
       return this.#modeRootEl;
@@ -2592,7 +3272,10 @@ ${comic.detailUrl}`)}`;
       return [...this.#shadow.querySelectorAll(selector)];
     }
     open() {
-      if (!this.#host.isConnected) document.documentElement.appendChild(this.#host);
+      if (!this.#host.isConnected) {
+        document.documentElement.appendChild(this.#host);
+        this.#bindEvents();
+      }
       this.#root.classList.add("myr-open");
       this.setToolbarVisible(false);
       this.updatePageIndicator(1, 0);
@@ -2630,7 +3313,7 @@ ${comic.detailUrl}`)}`;
         h("button", { class: "myr-btn", type: "button", onclick: () => this.#actions.exit() }, "退出"),
         h("div", { class: "myr-title" }, "增强阅读"),
         screenBtn,
-        h("button", { class: "myr-btn", type: "button", onclick: () => this.#openSettings() }, "设置")
+        h("button", { class: "myr-btn", type: "button", "data-settings-trigger": "", onclick: () => this.#openSettings() }, "设置")
       );
       const modeBtn = (kind, label) => {
         const btn2 = h("button", { class: "myr-btn myr-seg", type: "button", onclick: () => this.#actions.switchMode(kind) }, label);
@@ -2813,8 +3496,7 @@ ${comic.detailUrl}`)}`;
         dismissed = true;
       }
       if (this.#settingsSheet) {
-        this.#settingsSheet.remove();
-        this.#settingsSheet = null;
+        this.#closeSettings();
         dismissed = true;
       }
       if (this.#catalogSheet) {
@@ -2828,6 +3510,9 @@ ${comic.detailUrl}`)}`;
         dismissed = true;
       }
       return dismissed;
+    }
+    hasOpenPanel() {
+      return this.#root.querySelector(".myr-sheet-wrap") !== null;
     }
     /** 外部面板（如下载面板）挂载进 Shadow DOM（N-3 隔离）。 */
     openSheet(el2) {
@@ -2938,313 +3623,20 @@ ${comic.detailUrl}`)}`;
       now?.scrollIntoView({ block: "center" });
     }
     // ---------- 设置 ----------
+    #closeSettings() {
+      this.#settingsSheet?.remove();
+      this.#settingsSheet = null;
+      this.#toolbar.querySelector("[data-settings-trigger]")?.focus({ preventScroll: true });
+    }
     #openSettings() {
       this.#settingsSheet?.remove();
-      const s = this.#actions.settings();
-      const sheet = h(
-        "div",
-        { class: "myr-sheet-wrap myr-sheet-bottom" },
-        h(
-          "div",
-          { class: "myr-sheet myr-sheet-tall myr-settings" },
-          h(
-            "div",
-            { class: "myr-sheet-head" },
-            h("div", { class: "myr-sheet-title" }, "设置"),
-            h("button", {
-              class: "myr-btn myr-btn-small",
-              type: "button",
-              onclick: () => {
-                this.#settingsSheet?.remove();
-                this.#settingsSheet = null;
-              }
-            }, "关闭")
-          ),
-          h(
-            "div",
-            { class: "myr-sheet-body" },
-            this.#settingsGroup("阅读宽度（纵向）", this.#widthControl(s)),
-            this.#settingsGroup("横向适配", this.#horizontalFitControl(s)),
-            this.#settingsGroup("页间留隙", this.#gapToggle(s)),
-            this.#settingsGroup("单页适应", this.#fitControl(s)),
-            this.#settingsGroup("点击区", this.#tapZoneControl(s)),
-            this.#settingsGroup("背景", this.#bgControl(s)),
-            this.#settingsGroup("预加载", this.#preloadControl(s)),
-            this.#toggleRow("屏幕常亮", s.keepAwake, (on) => this.#actions.setKeepAwake(on)),
-            this.#toggleRow("连续模式点击区", s.tapInContinuous, (on) => this.#actions.setTapInContinuous(on)),
-            this.#toggleRow("进入阅读页自动打开", s.autoEnter, (on) => this.#actions.setAutoEnter(on)),
-            this.#settingsGroup("设置导入导出", h(
-              "div",
-              { class: "myr-row" },
-              h("button", {
-                class: "myr-btn myr-btn-small",
-                type: "button",
-                onclick: () => {
-                  const blob = new Blob([this.#actions.exportSettings()], { type: "application/json" });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = "mangayun-reader-settings.json";
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }
-              }, "导出"),
-              h(
-                "label",
-                { class: "myr-btn myr-btn-small myr-file-label" },
-                "导入",
-                (() => {
-                  const input = document.createElement("input");
-                  input.type = "file";
-                  input.accept = "application/json";
-                  input.addEventListener("change", async () => {
-                    const file = input.files?.[0];
-                    if (!file) return;
-                    const text = await file.text();
-                    const result = this.#actions.importSettings(text);
-                    this.toast(result.ok ? "导入成功" : `导入失败：${result.error ?? "未知错误"}`);
-                    if (result.ok) {
-                      this.#settingsSheet?.remove();
-                      this.#settingsSheet = null;
-                    }
-                  });
-                  return input;
-                })()
-              )
-            ))
-          )
-        )
-      );
-      this.#settingsSheet = sheet;
-      this.#root.append(sheet);
-    }
-    #settingsGroup(title, control) {
-      return h("div", { class: "myr-settings-group" }, h("div", { class: "myr-settings-label" }, title), control);
-    }
-    #toggleRow(title, on, setter) {
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = on;
-      input.addEventListener("change", () => setter(input.checked));
-      return h(
-        "div",
-        { class: "myr-settings-group myr-toggle-row" },
-        h("div", { class: "myr-settings-label" }, title),
-        input
-      );
-    }
-    #widthControl(s) {
-      const value = h("span", { class: "myr-value" }, `${s.verticalWidth}%`);
-      const input = document.createElement("input");
-      input.type = "range";
-      input.min = "50";
-      input.max = "100";
-      input.step = "5";
-      input.value = String(s.verticalWidth);
-      input.addEventListener("input", () => {
-        value.textContent = `${input.value}%`;
+      this.#settingsSheet = createSettingsPanel({
+        actions: this.#actions,
+        onClose: () => this.#closeSettings(),
+        toast: (message) => this.toast(message)
       });
-      input.addEventListener("change", () => this.#actions.setVerticalWidth(Number(input.value)));
-      return h("div", { class: "myr-row" }, input, value);
-    }
-    /** 横向连续模式的页面适配（参考 Mihon Fit screen/height）。 */
-    #horizontalFitControl(s) {
-      const fits = [
-        ["auto", "自动"],
-        ["height", "适应高度"],
-        ["screen", "适应屏幕"]
-      ];
-      const row = h("div", { class: "myr-row" });
-      for (const [fit, label] of fits) {
-        const btn2 = h("button", {
-          class: `myr-btn myr-seg${s.horizontalFit === fit ? " myr-seg-active" : ""}`,
-          type: "button",
-          onclick: () => {
-            this.#actions.setHorizontalFit(fit);
-            for (const b of row.querySelectorAll(".myr-seg")) b.classList.remove("myr-seg-active");
-            btn2.classList.add("myr-seg-active");
-          }
-        }, label);
-        row.append(btn2);
-      }
-      return h(
-        "div",
-        {},
-        row,
-        h(
-          "div",
-          { class: "myr-settings-label", style: "font-size:11px;margin-top:4px" },
-          "自动：竖屏整页可见、横屏按高度无缝"
-        )
-      );
-    }
-    /** 页间留隙开关（适应屏幕适配下 12px 空隙，可关为 0）。 */
-    #gapToggle(s) {
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = s.horizontalGap !== false;
-      input.addEventListener("change", () => this.#actions.setHorizontalGap(input.checked));
-      const label = h(
-        "label",
-        { class: "myr-toggle-row" },
-        h(
-          "span",
-          { class: "myr-settings-label" },
-          "保留页与页之间的空隙（日漫跨页拼接场景请关闭，页面零间隙相接）"
-        ),
-        input
-      );
-      return label;
-    }
-    #fitControl(s) {
-      const fits = [["screen", "适应屏幕"], ["width", "适应宽度"], ["height", "适应高度"], ["original", "原始大小"]];
-      const row = h("div", { class: "myr-row" });
-      for (const [fit, label] of fits) {
-        const btn2 = h("button", {
-          class: `myr-btn myr-seg${s.singleFit === fit ? " myr-seg-active" : ""}`,
-          type: "button",
-          onclick: () => {
-            this.#actions.setSingleFit(fit);
-            for (const b of row.querySelectorAll(".myr-seg")) b.classList.remove("myr-seg-active");
-            btn2.classList.add("myr-seg-active");
-          }
-        }, label);
-        row.append(btn2);
-      }
-      return row;
-    }
-    #bgControl(s) {
-      const bgs = [["black", "黑"], ["gray", "深灰"], ["white", "白"], ["system", "跟随系统"]];
-      const row = h("div", { class: "myr-row" });
-      for (const [bg, label] of bgs) {
-        const btn2 = h("button", {
-          class: `myr-btn myr-seg${s.background === bg ? " myr-seg-active" : ""}`,
-          type: "button",
-          onclick: () => {
-            this.#actions.setBackground(bg);
-            for (const b of row.querySelectorAll(".myr-seg")) b.classList.remove("myr-seg-active");
-            btn2.classList.add("myr-seg-active");
-          }
-        }, label);
-        row.append(btn2);
-      }
-      return row;
-    }
-    #preloadControl(s) {
-      const before = h("span", { class: "myr-value" }, String(s.preload.before));
-      const after = h("span", { class: "myr-value" }, String(s.preload.after));
-      const mk = (label, current, min, max, span, pick) => h(
-        "div",
-        { class: "myr-row" },
-        h("span", { class: "myr-mini-label" }, label),
-        h("button", { class: "myr-btn myr-btn-small", type: "button", onclick: () => {
-          const v = Math.max(min, current - 1);
-          span.textContent = String(v);
-          pick(v);
-        } }, "−"),
-        span,
-        h("button", { class: "myr-btn myr-btn-small", type: "button", onclick: () => {
-          const v = Math.min(max, current + 1);
-          span.textContent = String(v);
-          pick(v);
-        } }, "+")
-      );
-      const wrap = h(
-        "div",
-        {},
-        mk("之前", s.preload.before, 0, 5, before, (v) => this.#actions.setPreload(v, Number(after.textContent))),
-        mk("之后", s.preload.after, 1, 10, after, (v) => this.#actions.setPreload(Number(before.textContent), v))
-      );
-      return wrap;
-    }
-    /** 点击区编辑：四区选择 + 示意图 + 预设 + 恢复默认（R-S2、R-S4、R-S5）。 */
-    #tapZoneControl(s) {
-      const zones = { ...s.tapZones };
-      const preview = h("div", { class: "myr-zone-preview" });
-      const zoneNames = [["top", "上"], ["left", "左"], ["right", "右"], ["bottom", "下"]];
-      const actionLabel = { prev: "上一页", next: "下一页", none: "无操作" };
-      const renderPreview = () => {
-        preview.textContent = "";
-        const mk = (cls, label) => h("div", { class: `myr-zone myr-zone-${cls}` }, label);
-        preview.append(
-          mk("top", actionLabel[zones.top]),
-          h(
-            "div",
-            { class: "myr-zone-mid" },
-            mk("left", actionLabel[zones.left]),
-            mk("center", "菜单"),
-            mk("right", actionLabel[zones.right])
-          ),
-          mk("bottom", actionLabel[zones.bottom])
-        );
-      };
-      const selects = h("div", { class: "myr-row myr-wrap" });
-      for (const [zone, label] of zoneNames) {
-        const select = document.createElement("select");
-        select.className = "myr-select";
-        for (const action of ["prev", "next", "none"]) {
-          const opt = document.createElement("option");
-          opt.value = action;
-          opt.textContent = `${label}：${actionLabel[action]}`;
-          if (zones[zone] === action) opt.selected = true;
-          select.append(opt);
-        }
-        select.addEventListener("change", () => {
-          zones[zone] = select.value;
-          renderPreview();
-          this.#actions.setTapZones({ ...zones });
-        });
-        selects.append(select);
-      }
-      const presetRow = h("div", { class: "myr-row myr-wrap" });
-      for (const preset of Object.values(TAP_PRESETS)) {
-        presetRow.append(h("button", {
-          class: "myr-btn myr-btn-small",
-          type: "button",
-          onclick: () => {
-            Object.assign(zones, preset.zones);
-            renderPreview();
-            this.#actions.setTapZones({ ...zones });
-            for (const select of selects.querySelectorAll("select")) {
-              const zone = select.dataset.zone;
-              if (zone) select.value = zones[zone];
-            }
-          }
-        }, preset.label));
-      }
-      selects.querySelectorAll("select").forEach((sel, i) => {
-        sel.dataset.zone = zoneNames[i][0];
-      });
-      renderPreview();
-      return h(
-        "div",
-        {},
-        preview,
-        selects,
-        presetRow,
-        h(
-          "div",
-          { class: "myr-row" },
-          h("button", {
-            class: "myr-btn myr-btn-small",
-            type: "button",
-            onclick: () => {
-              Object.assign(zones, TAP_PRESETS.default.zones);
-              renderPreview();
-              this.#actions.setTapZones({ ...zones });
-            }
-          }, "恢复默认"),
-          h("button", {
-            class: "myr-btn myr-btn-small",
-            type: "button",
-            onclick: () => {
-              this.#settingsSheet?.remove();
-              this.#settingsSheet = null;
-              this.toast("已应用，点击试用");
-            }
-          }, "立即试用")
-        )
-      );
+      this.#root.append(this.#settingsSheet);
+      this.#settingsSheet.querySelector('[role="tab"][aria-selected="true"]')?.focus({ preventScroll: true });
     }
   }
   const TABLE = (() => {
@@ -3712,7 +4104,7 @@ ${comic.detailUrl}`)}`;
       const retryAfter = failure?.retryAfterMs;
       let waitMs;
       if (retryAfter != null && retryAfter > 0) {
-        waitMs = Math.min(MAX_BACKOFF_MS, retryAfter);
+        waitMs = retryAfter;
       } else {
         waitMs = Math.min(MAX_BACKOFF_MS, 1e3 * 2 ** this.#rateLimitHits);
       }
@@ -3739,11 +4131,6 @@ ${comic.detailUrl}`)}`;
     /** 用户暂停：立即停止发起新请求（R-D6）。 */
     pause() {
       this.#running = false;
-      if (this.#pauseTimer != null) {
-        clearTimeout(this.#pauseTimer);
-        this.#pauseTimer = null;
-        this.#globalPauseUntil = 0;
-      }
     }
     resume() {
       if (this.#cancelled) return;
@@ -3803,7 +4190,7 @@ ${comic.detailUrl}`)}`;
   }
   function resumableTasks(kv) {
     return listTasks(kv).filter(
-      (t) => t.state === "resolving" || t.state === "downloading" || t.state === "paused" || t.state === "incomplete"
+      (t) => t.state === "resolving" || t.state === "downloading" || t.state === "paused" || t.state === "incomplete" || t.state === "failed"
     );
   }
   function deleteTask(kv, id) {
@@ -3836,6 +4223,9 @@ ${comic.detailUrl}`)}`;
   const FLAG_UTF8 = 2048;
   const U32_MAX = 4294967295;
   const U16_MAX = 65535;
+  const ZIP64_VERSION = 45;
+  const DEFAULT_VERSION = 20;
+  const ZIP64_EXTRA_ID = 1;
   function dosDateTime(d) {
     const year = Math.max(1980, d.getFullYear());
     const date = (year - 1980 << 9 | d.getMonth() + 1 << 5 | d.getDate()) & 65535;
@@ -3847,58 +4237,74 @@ ${comic.detailUrl}`)}`;
     #records = [];
     #offset = 0;
     #closed = false;
+    #closePromise = null;
     #createdAt = dosDateTime(/* @__PURE__ */ new Date());
     constructor(sink) {
       this.#sink = sink;
+    }
+    async #write(chunk) {
+      await this.#sink.write(chunk);
+      this.#offset += chunk.length;
+    }
+    #writeUint64(view, offset, value, label) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`${label} is not a non-negative safe integer`);
+      }
+      view.setBigUint64(offset, BigInt(value), true);
     }
     async add(name, data) {
       if (this.#closed) throw new Error("zip writer already closed");
       const nameBytes = new TextEncoder().encode(name);
       if (nameBytes.length > U16_MAX) throw new Error("entry name too long");
       const localOffset = this.#offset;
-      const zip64 = data.length > U32_MAX || localOffset > U32_MAX;
+      const sizeZip64 = data.length >= U32_MAX;
+      const offsetZip64 = localOffset >= U32_MAX;
+      const zip64 = sizeZip64 || offsetZip64;
       const crc = crc32(data);
-      const header = new Uint8Array(30 + nameBytes.length + (zip64 ? 20 : 0));
+      const localExtraLength = sizeZip64 ? 20 : 0;
+      const header = new Uint8Array(30 + nameBytes.length + localExtraLength);
       const view = new DataView(header.buffer);
       view.setUint32(0, SIG_LOCAL, true);
-      view.setUint16(4, zip64 ? 45 : 20, true);
+      view.setUint16(4, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true);
       view.setUint16(6, FLAG_UTF8, true);
       view.setUint16(8, 0, true);
       view.setUint16(10, this.#createdAt.time, true);
       view.setUint16(12, this.#createdAt.date, true);
       view.setUint32(14, crc, true);
-      view.setUint32(18, zip64 ? U32_MAX : data.length, true);
-      view.setUint32(22, zip64 ? U32_MAX : data.length, true);
+      view.setUint32(18, sizeZip64 ? U32_MAX : data.length, true);
+      view.setUint32(22, sizeZip64 ? U32_MAX : data.length, true);
       view.setUint16(26, nameBytes.length, true);
-      view.setUint16(28, zip64 ? 20 : 0, true);
+      view.setUint16(28, localExtraLength, true);
       header.set(nameBytes, 30);
-      if (zip64) {
+      if (sizeZip64) {
         const extra = 30 + nameBytes.length;
-        view.setUint16(extra, 1, true);
+        view.setUint16(extra, ZIP64_EXTRA_ID, true);
         view.setUint16(extra + 2, 16, true);
-        view.setUint32(extra + 4, data.length, true);
-        view.setUint32(extra + 8, 0, true);
-        view.setUint32(extra + 12, data.length, true);
-        view.setUint32(extra + 16, 0, true);
+        this.#writeUint64(view, extra + 4, data.length, "entry size");
+        this.#writeUint64(view, extra + 12, data.length, "entry compressed size");
       }
-      await this.#sink.write(header);
-      await this.#sink.write(data);
-      this.#offset += header.length + data.length;
-      this.#records.push({ nameBytes, crc, size: data.length, localOffset, zip64 });
+      await this.#write(header);
+      await this.#write(data);
+      this.#records.push({ nameBytes, crc, size: data.length, localOffset });
     }
-    async close() {
-      if (this.#closed) return;
+    close() {
+      if (this.#closePromise) return this.#closePromise;
       this.#closed = true;
+      this.#closePromise = this.#close();
+      return this.#closePromise;
+    }
+    async #close() {
       const cdStart = this.#offset;
       for (const rec of this.#records) {
-        const offsetNeeds64 = rec.localOffset > U32_MAX;
-        const sizeNeeds64 = rec.size > U32_MAX;
-        const extraLen = rec.zip64 ? (sizeNeeds64 ? 24 : 0) + (offsetNeeds64 ? 8 : 0) || 20 : 0;
+        const offsetNeeds64 = rec.localOffset >= U32_MAX;
+        const sizeNeeds64 = rec.size >= U32_MAX;
+        const zip64 = sizeNeeds64 || offsetNeeds64;
+        const extraLen = zip64 ? 4 + (sizeNeeds64 ? 16 : 0) + (offsetNeeds64 ? 8 : 0) : 0;
         const buf = new Uint8Array(46 + rec.nameBytes.length + extraLen);
         const view = new DataView(buf.buffer);
         view.setUint32(0, SIG_CENTRAL, true);
-        view.setUint16(4, rec.zip64 ? 45 : 20, true);
-        view.setUint16(6, rec.zip64 ? 45 : 20, true);
+        view.setUint16(4, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true);
+        view.setUint16(6, zip64 ? ZIP64_VERSION : DEFAULT_VERSION, true);
         view.setUint16(8, FLAG_UTF8, true);
         view.setUint16(10, 0, true);
         view.setUint16(12, this.#createdAt.time, true);
@@ -3914,63 +4320,58 @@ ${comic.detailUrl}`)}`;
         view.setUint32(38, 0, true);
         view.setUint32(42, offsetNeeds64 ? U32_MAX : rec.localOffset, true);
         buf.set(rec.nameBytes, 46);
-        if (rec.zip64) {
+        if (zip64) {
           let p = 46 + rec.nameBytes.length;
-          view.setUint16(p, 1, true);
+          view.setUint16(p, ZIP64_EXTRA_ID, true);
           view.setUint16(p + 2, extraLen - 4, true);
           p += 4;
           if (sizeNeeds64) {
-            view.setUint32(p, rec.size, true);
-            view.setUint32(p + 4, 0, true);
-            view.setUint32(p + 8, rec.size, true);
-            view.setUint32(p + 12, 0, true);
+            this.#writeUint64(view, p, rec.size, "central entry size");
+            this.#writeUint64(view, p + 8, rec.size, "central entry compressed size");
             p += 16;
           }
           if (offsetNeeds64) {
-            view.setUint32(p, rec.localOffset, true);
-            view.setUint32(p + 4, 0, true);
+            this.#writeUint64(view, p, rec.localOffset, "central local-header offset");
           }
         }
-        await this.#sink.write(buf);
+        await this.#write(buf);
       }
       const cdSize = this.#offset - cdStart;
-      const needZip64Eocd = this.#records.length > U16_MAX || cdStart > U32_MAX || cdSize > U32_MAX;
+      const needZip64Eocd = this.#records.length >= U16_MAX || cdStart >= U32_MAX || cdSize >= U32_MAX;
       if (needZip64Eocd) {
         const zip64Offset = this.#offset;
         const eocd64 = new Uint8Array(56);
         const v64 = new DataView(eocd64.buffer);
         v64.setUint32(0, SIG_EOCD64, true);
         v64.setBigUint64(4, BigInt(44), true);
-        v64.setUint16(12, 45, true);
-        v64.setUint16(14, 45, true);
+        v64.setUint16(12, ZIP64_VERSION, true);
+        v64.setUint16(14, ZIP64_VERSION, true);
         v64.setUint32(16, 0, true);
         v64.setUint32(20, 0, true);
         v64.setBigUint64(24, BigInt(this.#records.length), true);
         v64.setBigUint64(32, BigInt(this.#records.length), true);
         v64.setBigUint64(40, BigInt(cdSize), true);
         v64.setBigUint64(48, BigInt(cdStart), true);
-        await this.#sink.write(eocd64);
+        await this.#write(eocd64);
         const locator = new Uint8Array(20);
         const vl = new DataView(locator.buffer);
         vl.setUint32(0, SIG_LOCATOR64, true);
         vl.setUint32(4, 0, true);
         vl.setBigUint64(8, BigInt(zip64Offset), true);
         vl.setUint32(16, 1, true);
-        await this.#sink.write(locator);
-        this.#offset += 76;
+        await this.#write(locator);
       }
       const eocd = new Uint8Array(22);
       const ve = new DataView(eocd.buffer);
       ve.setUint32(0, SIG_EOCD, true);
       ve.setUint16(4, 0, true);
       ve.setUint16(6, 0, true);
-      ve.setUint16(8, this.#records.length > U16_MAX ? U16_MAX : this.#records.length, true);
-      ve.setUint16(10, this.#records.length > U16_MAX ? U16_MAX : this.#records.length, true);
-      ve.setUint32(12, cdSize > U32_MAX ? U32_MAX : cdSize, true);
-      ve.setUint32(16, cdStart > U32_MAX ? U32_MAX : cdStart, true);
+      ve.setUint16(8, needZip64Eocd ? U16_MAX : this.#records.length, true);
+      ve.setUint16(10, needZip64Eocd ? U16_MAX : this.#records.length, true);
+      ve.setUint32(12, needZip64Eocd ? U32_MAX : cdSize, true);
+      ve.setUint32(16, needZip64Eocd ? U32_MAX : cdStart, true);
       ve.setUint16(20, 0, true);
-      await this.#sink.write(eocd);
-      this.#offset += 22;
+      await this.#write(eocd);
       await this.#sink.close?.();
     }
     get byteLength() {
@@ -4030,7 +4431,8 @@ ${comic.detailUrl}`)}`;
     return sanitizeName(title, 120) || "comic";
   }
   function partialSuffix(name) {
-    return `${name}_partial`;
+    const dot = name.lastIndexOf(".");
+    return dot > 0 ? `${name.slice(0, dot)}_partial${name.slice(dot)}` : `${name}_partial`;
   }
   function buildReport(input) {
     const chapters = input.chapters.map((c) => {
@@ -4049,7 +4451,7 @@ ${comic.detailUrl}`)}`;
     const complete = chapters.every((c) => c.missing.length === 0);
     return {
       tool: "mangayun-reader",
-      version: "1.0.0",
+      version,
       createdAt: (/* @__PURE__ */ new Date()).toISOString(),
       site: { siteId: input.ref.siteId, verified: input.siteVerified },
       comic: { title: input.title, detailUrl: input.ref.detailUrl },
@@ -4064,22 +4466,34 @@ ${comic.detailUrl}`)}`;
   async function packToSink(sink, input, loadBytes, keyOf) {
     const writer = new StoreZipWriter(sink);
     const root = comicRootName(input.title);
-    for (const [ci, c] of input.chapters.entries()) {
-      const folder = chapterFolderName(c.chapter.order, c.chapter.name);
-      for (const page of c.pages) {
-        if (page.ext == null) continue;
-        const bytes = page.bytes ?? await loadBytes(keyOf(ci, page.page));
-        if (!bytes) continue;
-        await writer.add(`${root}/${folder}/${pageFileName(page.page, page.ext)}`, bytes);
+    try {
+      for (const [ci, c] of input.chapters.entries()) {
+        const folder = chapterFolderName(c.chapter.order, c.chapter.name);
+        for (const page of c.pages) {
+          if (page.ext == null) continue;
+          const bytes = page.bytes ?? await loadBytes(keyOf(ci, page.page));
+          if (!bytes) {
+            throw new Error(
+              `missing cached page ${c.chapter.name} page ${page.page + 1} (${keyOf(ci, page.page)})`
+            );
+          }
+          await writer.add(`${root}/${folder}/${pageFileName(page.page + 1, page.ext)}`, bytes);
+        }
       }
+      const report = buildReport(input);
+      await writer.add(
+        `${root}/download-report.json`,
+        new TextEncoder().encode(JSON.stringify(report, null, 2))
+      );
+      await writer.close();
+      return { byteLength: writer.byteLength, entryCount: writer.entryCount, report };
+    } catch (error) {
+      try {
+        await sink.abort?.();
+      } catch {
+      }
+      throw error;
     }
-    const report = buildReport(input);
-    await writer.add(
-      `${root}/download-report.json`,
-      new TextEncoder().encode(JSON.stringify(report, null, 2))
-    );
-    await writer.close();
-    return { byteLength: writer.byteLength, entryCount: writer.entryCount, report };
   }
   function opfsSink(writable) {
     return {
@@ -4088,6 +4502,9 @@ ${comic.detailUrl}`)}`;
       },
       async close() {
         await writable.close();
+      },
+      async abort() {
+        await writable.abort();
       }
     };
   }
@@ -4099,6 +4516,10 @@ ${comic.detailUrl}`)}`;
       this.#bytes += chunk.length;
     }
     async close() {
+    }
+    async abort() {
+      this.#chunks = [];
+      this.#bytes = 0;
     }
     get byteLength() {
       return this.#bytes;
@@ -4132,6 +4553,7 @@ ${comic.detailUrl}`)}`;
     #speedWindow = [];
     #pack = null;
     #running = false;
+    #lockedTaskId = null;
     constructor(deps) {
       this.#deps = deps;
     }
@@ -4187,39 +4609,58 @@ ${comic.detailUrl}`)}`;
     }
     /** 恢复任务（R-D13）：已缓存页跳过，其余重新解析后下载。 */
     async resume(taskId) {
+      if (this.#running || this.#lockedTaskId) return false;
       const cached = loadTask(this.#deps.kv, taskId);
       if (!cached) return false;
-      const cache = await this.ensureCache();
-      cached.storage = cache.kind;
-      cached.state = "resolving";
-      cached.note = null;
-      for (const [ci, c] of cached.chapters.entries()) {
-        for (let p = 0; p < c.pages.length; p++) {
-          if (c.pages[p] === "cached") {
-            const hit = await cache.get(this.cacheKeyOf(taskId, ci, p));
-            if (!hit) c.pages[p] = "pending";
-          }
-        }
-        c.failures = [];
-      }
       this.#task = cached;
+      this.#pack = null;
       this.#abort = false;
       this.#userPaused = false;
-      saveTask(this.#deps.kv, cached);
-      void this.#run(cached);
+      void this.#run(cached, async () => {
+        const latest = loadTask(this.#deps.kv, taskId);
+        if (!latest) throw new Error("任务不存在或已清理");
+        Object.assign(cached, latest);
+        const cache = await this.ensureCache();
+        cached.storage = cache.kind;
+        cached.state = "resolving";
+        cached.note = null;
+        for (const [ci, c] of cached.chapters.entries()) {
+          for (let p = 0; p < c.pages.length; p++) {
+            if (c.pages[p] === "cached" && !await cache.get(this.cacheKeyOf(taskId, ci, p))) c.pages[p] = "pending";
+          }
+          c.failures = [];
+        }
+        saveTask(this.#deps.kv, cached);
+      });
       return true;
     }
-    async #run(task) {
+    async #run(task, prepare) {
       if (this.#running) return;
       this.#running = true;
       try {
-        const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => this.#runInner(task));
+        const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => {
+          this.#lockedTaskId = task.id;
+          try {
+            await prepare?.();
+            await this.#runInner(task);
+          } catch (error) {
+            task.state = "failed";
+            task.note = error instanceof Error ? error.message : String(error);
+            saveTask(this.#deps.kv, task);
+            this.#emit();
+          } finally {
+            this.#lockedTaskId = null;
+          }
+        });
         if (!outcome.acquired) {
           task.state = "paused";
           task.note = "另一个标签页正在执行本任务";
-          saveTask(this.#deps.kv, task);
           this.#emit();
         }
+      } catch (error) {
+        task.state = "failed";
+        task.note = error instanceof Error ? error.message : String(error);
+        this.#emit();
       } finally {
         this.#running = false;
       }
@@ -4289,6 +4730,7 @@ ${comic.detailUrl}`)}`;
                     } catch (e) {
                       if (e instanceof MemoryCapError) {
                         capHit = true;
+                        scheduler.cancel();
                         throw e;
                       }
                       throw e;
@@ -4387,15 +4829,18 @@ ${comic.detailUrl}`)}`;
       }
     }
     resumePaused() {
+      const task = this.#task;
+      if (!task) return;
+      if (!this.#running) {
+        void this.resume(task.id);
+        return;
+      }
+      if (this.#lockedTaskId !== task.id) return;
       this.#userPaused = false;
       this.#scheduler?.resume();
-      if (this.#task) {
-        const task = this.#task;
-        task.note = null;
-        saveTask(this.#deps.kv, task);
-        if (!this.#running) void this.#run(task);
-        this.#emit();
-      }
+      task.note = null;
+      saveTask(this.#deps.kv, task);
+      this.#emit();
     }
     cancel() {
       this.#abort = true;
@@ -4411,6 +4856,11 @@ ${comic.detailUrl}`)}`;
     async retryFailed() {
       const task = this.#task;
       if (!task) return;
+      if (!this.#running) {
+        await this.resume(task.id);
+        return;
+      }
+      if (this.#lockedTaskId !== task.id) return;
       for (const c of task.chapters) {
         c.failures = [];
         for (let p = 0; p < c.pages.length; p++) {
@@ -4423,76 +4873,106 @@ ${comic.detailUrl}`)}`;
       saveTask(this.#deps.kv, task);
       this.#abort = false;
       this.#userPaused = false;
-      if (!this.#running) void this.#run(task);
       this.#emit();
     }
     /** 打包（R-D5）。partial=true 时文件名加 _partial（R-D9）。 */
     async pack(partial) {
       const task = this.#task;
       if (!task) throw new Error("没有进行中的任务");
-      const cache = await this.ensureCache();
-      task.state = "packing";
-      saveTask(this.#deps.kv, task);
-      this.#emit();
-      const input = {
-        ref: task.ref,
-        title: task.title,
-        siteVerified: VERIFIED_SOURCES.has(task.ref.siteId),
-        chapters: task.chapters.map((c) => ({
-          chapter: c.chapter,
-          expectedPages: c.expectedPages,
-          pages: c.pages.map((status, page) => ({
-            page,
-            ext: status === "cached" ? c.exts[page] ?? "jpg" : null
-          }))
-        }))
-      };
-      const keyOf = (ci, page) => this.cacheKeyOf(task.id, ci, page);
-      let handle;
-      if (cache.kind === "opfs") {
-        const root = await navigator.storage.getDirectory();
-        const ns = await root.getDirectoryHandle("myr-v1", { create: true });
-        const zips = await ns.getDirectoryHandle("zips", { create: true });
-        const fileHandle = await zips.getFileHandle(`${task.id}.zip`, { create: true });
-        const writable = await fileHandle.createWritable();
-        const result = await packToSink(
-          opfsSink(writable),
-          input,
-          (key) => cache.get(key).then((c) => c?.bytes ?? null),
-          keyOf
-        );
-        handle = {
-          taskId: task.id,
-          fileName: zipFileName(task.title, partial),
-          byteLength: result.byteLength,
-          file: await fileHandle.getFile(),
-          blob: null,
-          report: result.report
-        };
-      } else {
-        const sink = new MemorySink();
-        const result = await packToSink(
-          sink,
-          input,
-          (key) => cache.get(key).then((c) => c?.bytes ?? null),
-          keyOf
-        );
-        handle = {
-          taskId: task.id,
-          fileName: zipFileName(task.title, partial),
-          byteLength: result.byteLength,
-          file: null,
-          blob: sink.toBlob(),
-          report: result.report
-        };
+      this.#pack = null;
+      if (this.#lockedTaskId === task.id) return this.#packTask(task, partial);
+      const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => {
+        this.#lockedTaskId = task.id;
+        try {
+          return await this.#packTask(task, partial);
+        } finally {
+          this.#lockedTaskId = null;
+        }
+      });
+      if (!outcome.acquired) {
+        task.state = "paused";
+        task.note = "另一个标签页正在执行本任务";
+        this.#emit();
+        throw new Error(task.note);
       }
-      task.state = "packed";
-      task.zipName = handle.fileName;
+      return outcome.result;
+    }
+    async #packTask(task, partial) {
+      this.#pack = null;
+      task.state = "packing";
+      task.note = null;
       saveTask(this.#deps.kv, task);
-      this.#pack = handle;
       this.#emit();
-      this.#deps.onPacked(handle);
-      return handle;
+      try {
+        const cache = await this.ensureCache();
+        const input = {
+          ref: task.ref,
+          title: task.title,
+          partial,
+          siteVerified: VERIFIED_SOURCES.has(task.ref.siteId),
+          chapters: task.chapters.map((c) => ({
+            chapter: c.chapter,
+            expectedPages: c.expectedPages,
+            pages: c.pages.map((status, page) => ({
+              page,
+              ext: status === "cached" ? c.exts[page] ?? "jpg" : null
+            }))
+          }))
+        };
+        const keyOf = (ci, page) => this.cacheKeyOf(task.id, ci, page);
+        let handle;
+        if (cache.kind === "opfs") {
+          const root = await navigator.storage.getDirectory();
+          const ns = await root.getDirectoryHandle("myr-v1", { create: true });
+          const zips = await ns.getDirectoryHandle("zips", { create: true });
+          const fileHandle = await zips.getFileHandle(`${task.id}.zip`, { create: true });
+          const writable = await fileHandle.createWritable();
+          const result = await packToSink(
+            opfsSink(writable),
+            input,
+            (key) => cache.get(key).then((c) => c?.bytes ?? null),
+            keyOf
+          );
+          handle = {
+            taskId: task.id,
+            fileName: zipFileName(task.title, partial),
+            byteLength: result.byteLength,
+            file: await fileHandle.getFile(),
+            blob: null,
+            report: result.report
+          };
+        } else {
+          const sink = new MemorySink();
+          const result = await packToSink(
+            sink,
+            input,
+            (key) => cache.get(key).then((c) => c?.bytes ?? null),
+            keyOf
+          );
+          handle = {
+            taskId: task.id,
+            fileName: zipFileName(task.title, partial),
+            byteLength: result.byteLength,
+            file: null,
+            blob: sink.toBlob(),
+            report: result.report
+          };
+        }
+        task.state = "packed";
+        task.zipName = handle.fileName;
+        saveTask(this.#deps.kv, task);
+        this.#pack = handle;
+        this.#emit();
+        this.#deps.onPacked(handle);
+        return handle;
+      } catch (error) {
+        this.#pack = null;
+        task.state = "failed";
+        task.note = error instanceof Error ? error.message : String(error);
+        saveTask(this.#deps.kv, task);
+        this.#emit();
+        throw error;
+      }
     }
     markHandedOff() {
       const task = this.#task;
@@ -4795,21 +5275,30 @@ ${comic.detailUrl}`)}`;
         if (p.state === "downloading" || p.state === "resolving") {
           insert(btn("暂停", false, () => this.#deps.manager.pause()));
         } else if (p.state === "paused") {
-          insert(
-            btn("继续", true, () => this.#deps.manager.resumePaused()),
-            btn("取消", false, () => void this.onCancelChoice())
-          );
+          if (p.note?.includes("另一个标签页")) {
+            insert(btn("重新检查", true, () => this.#deps.manager.resumePaused()));
+          } else {
+            insert(
+              btn("继续", true, () => this.#deps.manager.resumePaused()),
+              btn("取消", false, () => void this.onCancelChoice())
+            );
+            if (p.storage === "memory" && p.cachedPages > 0 && p.note?.includes("上限")) {
+              insert(btn("导出部分结果", false, () => void this.#packAndShow(true)));
+            }
+          }
         } else if (p.state === "incomplete") {
           const failed = p.failedPages > 0;
           failList.style.display = failed ? "block" : "none";
           if (failed) failList.textContent = `失败 ${p.failedPages} 页；可选择“只重试失败项”，或导出已有部分（文件名加 _partial）`;
           insert(
             btn("只重试失败项", true, () => void this.#deps.manager.retryFailed()),
-            btn("导出部分结果", false, () => void this.#deps.manager.pack(true).then(() => this.#showSave())),
+            btn("导出部分结果", false, () => void this.#packAndShow(true)),
             btn("取消任务", false, () => void this.onCancelChoice())
           );
         } else if (p.state === "packed") {
           insert(btn("保存 ZIP", true, () => this.#showSave()));
+        } else if (p.state === "failed") {
+          insert(btn("重新解析并恢复", true, () => void this.#deps.manager.retryFailed()));
         }
       };
       const current = this.#deps.manager.task;
@@ -4883,13 +5372,22 @@ ${comic.detailUrl}`)}`;
             resultLine.textContent = result.status === "saved" ? "已保存" : result.status === "handed-off" ? "已交给系统下载，请在系统下载记录确认" : `保存失败：${result.detail ?? ""}`;
             if (result.status !== "failed") this.#deps.manager.markHandedOff();
           }),
-          btn("重新打包", false, () => void this.#deps.manager.pack(pack.report.result === "partial").then(() => this.#showSave())),
+          btn("重新打包", false, () => void this.#packAndShow(pack.report.result === "partial")),
           btn("清理任务", false, () => {
             void this.#deps.manager.cleanup();
             this.close();
           })
         )
       );
+    }
+    async #packAndShow(partial) {
+      try {
+        await this.#deps.manager.pack(partial);
+        this.#showSave();
+      } catch (error) {
+        this.#deps.toast(`打包失败：${error instanceof Error ? error.message : String(error)}`);
+        this.#showProgress();
+      }
     }
   }
   function formatBytes(n) {
@@ -4902,7 +5400,7 @@ ${comic.detailUrl}`)}`;
     const kv = deps.kv ?? createKV();
     const settingsStore = new SettingsStore(kv);
     const progress = new ProgressStore(kv);
-    const controller = new ReaderController({ adapter: deps.adapter, settingsStore, progress });
+    const controller = new ReaderController({ adapter: deps.adapter, settingsStore, progress, onActiveChange: deps.onReaderActiveChange });
     const actions = {
       exit: () => controller.exit(),
       switchMode: (kind) => controller.switchMode(kind),
@@ -4942,7 +5440,7 @@ ${comic.detailUrl}`)}`;
       },
       setKeepAwake: (on) => {
         settingsStore.update({ keepAwake: on });
-        if (on) void controller.requestWakeLock();
+        void controller.requestWakeLock();
       },
       setAutoEnter: (on) => {
         settingsStore.update({ autoEnter: on });
@@ -4950,6 +5448,12 @@ ${comic.detailUrl}`)}`;
       setTapInContinuous: (on) => {
         settingsStore.update({ tapInContinuous: on });
         controller.applySettingChanges();
+      },
+      setDownloadConcurrency: (value) => {
+        settingsStore.update({ download: { concurrency: value } });
+      },
+      resetEntryPosition: () => {
+        settingsStore.update({ floatPos: void 0 });
       },
       jumpToPage: (page) => controller.jumpToPage(page),
       jumpToChapter: (chapter) => controller.navigateToChapter(chapter),
@@ -4961,7 +5465,15 @@ ${comic.detailUrl}`)}`;
       toggleFullscreen: () => void controller.toggleFullscreen(),
       openDownload: () => panel.open(),
       exportSettings: () => exportData(kv),
-      importSettings: (json) => importData(kv, json),
+      importSettings: (json) => {
+        const result = importData(kv, json);
+        if (result.ok) {
+          settingsStore.reload();
+          controller.applySettingChanges();
+          void controller.requestWakeLock();
+        }
+        return result;
+      },
       settings: () => settingsStore.effective(controller.comic)
     };
     const ui = new OverlayUI(actions);
@@ -4972,9 +5484,7 @@ ${comic.detailUrl}`)}`;
       kv,
       onProgress: (p) => {
         panel.onProgress(p);
-        if (p.state === "downloading" || p.state === "resolving" || p.state === "packing") {
-          void controller.requestWakeLock();
-        }
+        controller.setDownloadActive(p.state === "downloading" || p.state === "resolving" || p.state === "packing");
       },
       onPacked: (handle) => panel.onPacked(handle)
     });
@@ -5004,21 +5514,61 @@ ${comic.detailUrl}`)}`;
     );
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState === "hidden") progress.flush();
-      else void controller.requestWakeLock();
+      void controller.requestWakeLock();
     });
     window.addEventListener("pagehide", () => progress.flush());
     return { controller, ui, manager, panel, settingsStore, progress, kv };
   }
+  const ENTRY_SIZE = 52;
+  const EDGE = 12;
+  const DEFAULT_BOTTOM_CLEARANCE = 96;
+  function clamp(value, min, max) {
+    return Math.min(max, Math.max(min, value));
+  }
+  function bounds(viewport) {
+    const left = viewport.left + EDGE + (viewport.safeLeft ?? 0);
+    const top = viewport.top + EDGE + (viewport.safeTop ?? 0);
+    return {
+      left,
+      top,
+      right: Math.max(left, viewport.left + viewport.width - ENTRY_SIZE - EDGE - (viewport.safeRight ?? 0)),
+      bottom: Math.max(top, viewport.top + viewport.height - ENTRY_SIZE - EDGE - (viewport.safeBottom ?? 0))
+    };
+  }
+  function clampEntryPosition(x, y, viewport) {
+    const box = bounds(viewport);
+    return { x: clamp(x, box.left, box.right), y: clamp(y, box.top, box.bottom) };
+  }
+  function restoreEntryPosition(saved, viewport) {
+    const box = bounds(viewport);
+    const side = saved?.side === "left" || saved?.side === "right" ? saved.side : Number.isFinite(saved?.x) && saved.x < (box.left + box.right) / 2 ? "left" : "right";
+    const defaultY = viewport.top + viewport.height - ENTRY_SIZE - DEFAULT_BOTTOM_CLEARANCE - (viewport.safeBottom ?? 0);
+    const y = Number.isFinite(saved?.yRatio) ? box.top + clamp(saved.yRatio, 0, 1) * (box.bottom - box.top) : Number.isFinite(saved?.y) ? saved.y : defaultY;
+    const top = clamp(y, box.top, box.bottom);
+    return {
+      x: side === "left" ? box.left : box.right,
+      y: top,
+      side,
+      yRatio: box.bottom === box.top ? 0 : (top - box.top) / (box.bottom - box.top)
+    };
+  }
+  function snapEntryPosition(position, viewport) {
+    return restoreEntryPosition({ x: position.x, y: position.y }, viewport);
+  }
   const DRAG_THRESHOLD_PX = 12;
-  const EDGE = 8;
   class FloatingEntry {
     #host;
     #btn;
     #opts;
+    #position = { x: 0, y: 0 };
+    #visualViewport = null;
+    #drag = null;
+    #suppressClick = false;
     constructor(opts) {
       this.#opts = opts;
       this.#host = document.createElement("div");
-      this.#host.style.cssText = "position:fixed;z-index:2147483646;";
+      this.#host.id = "myr-entry-host";
+      this.#host.style.cssText = "position:fixed;width:52px;height:52px;z-index:2147483646;--myr-safe-top:env(safe-area-inset-top,0px);--myr-safe-bottom:env(safe-area-inset-bottom,0px);--myr-safe-left:env(safe-area-inset-left,0px);--myr-safe-right:env(safe-area-inset-right,0px);";
       const shadow = this.#host.attachShadow({ mode: "open" });
       const style = document.createElement("style");
       style.textContent = STYLES;
@@ -5026,56 +5576,92 @@ ${comic.detailUrl}`)}`;
       this.#btn = document.createElement("button");
       this.#btn.className = "myr-entry";
       this.#btn.type = "button";
-      this.#btn.textContent = "增强\n阅读";
-      this.#btn.style.whiteSpace = "pre";
+      this.#btn.setAttribute("aria-label", "打开增强阅读器");
+      this.#btn.title = "增强阅读 · 拖动可调整位置";
+      this.#btn.append(icon("book"));
       shadow.append(this.#btn);
-      let start = null;
-      let dragged = false;
       this.#btn.addEventListener("pointerdown", (e) => {
-        start = { x: e.clientX, y: e.clientY, left: this.#host.offsetLeft, top: this.#host.offsetTop };
-        dragged = false;
+        if (e.button !== 0 || e.isPrimary === false || this.#drag) return;
+        this.#suppressClick = false;
+        this.#drag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: this.#position.x, top: this.#position.y, moved: false };
         this.#btn.setPointerCapture(e.pointerId);
         e.stopPropagation();
       });
       this.#btn.addEventListener("pointermove", (e) => {
-        if (!start) return;
+        const start = this.#drag;
+        if (!start || start.id !== e.pointerId) return;
         const dx = e.clientX - start.x;
         const dy = e.clientY - start.y;
-        if (!dragged && Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) dragged = true;
-        if (dragged) this.#place(start.left + dx, start.top + dy);
-        e.stopPropagation();
-      });
-      this.#btn.addEventListener("pointerup", (e) => {
-        if (start && dragged) {
-          this.#opts.savePosition(this.#normalize());
-        } else if (start) {
-          this.#opts.onTap();
+        if (Math.hypot(dx, dy) > DRAG_THRESHOLD_PX) start.moved = true;
+        if (start.moved) {
+          this.#btn.classList.add("myr-entry-dragging");
+          this.#place(clampEntryPosition(start.left + dx, start.top + dy, this.#viewport()));
         }
-        start = null;
         e.stopPropagation();
       });
-      this.#btn.addEventListener("pointercancel", () => {
-        start = null;
+      this.#btn.addEventListener("pointerup", (e) => this.#finishDrag(e, false));
+      this.#btn.addEventListener("pointercancel", (e) => this.#finishDrag(e, true));
+      this.#btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const suppress = this.#suppressClick && e.detail !== 0;
+        this.#suppressClick = false;
+        if (!suppress) this.#opts.onTap();
       });
-      this.#btn.addEventListener("click", (e) => e.stopPropagation());
-      const saved = this.#opts.loadPosition();
-      this.#place(saved?.x ?? window.innerWidth - 110, saved?.y ?? window.innerHeight * 0.55);
     }
-    #place(x, y) {
-      const w = this.#btn.offsetWidth || 88;
-      const h2 = this.#btn.offsetHeight || 52;
-      const left = Math.min(window.innerWidth - w - EDGE, Math.max(EDGE, x));
-      const top = Math.min(window.innerHeight - h2 - EDGE, Math.max(EDGE, y));
-      this.#host.style.left = `${Math.round(left)}px`;
-      this.#host.style.top = `${Math.round(top)}px`;
+    #viewport() {
+      const visual = window.visualViewport;
+      const style = getComputedStyle(this.#host);
+      const inset = (edge) => Number.parseFloat(style.getPropertyValue(`--myr-safe-${edge}`)) || 0;
+      return {
+        left: visual?.offsetLeft ?? 0,
+        top: visual?.offsetTop ?? 0,
+        width: visual?.width || window.innerWidth,
+        height: visual?.height || window.innerHeight,
+        safeTop: inset("top"),
+        safeBottom: inset("bottom"),
+        safeLeft: inset("left"),
+        safeRight: inset("right")
+      };
     }
-    #normalize() {
-      return { x: this.#host.offsetLeft, y: this.#host.offsetTop };
+    #place(position) {
+      this.#position = position;
+      this.#host.style.left = `${Math.round(position.x)}px`;
+      this.#host.style.top = `${Math.round(position.y)}px`;
+      if (position.side) this.#btn.dataset.side = position.side;
     }
+    #finishDrag(event, cancelled) {
+      const drag = this.#drag;
+      if (!drag || drag.id !== event.pointerId) return;
+      this.#drag = null;
+      this.#suppressClick = cancelled || drag.moved;
+      this.#btn.classList.remove("myr-entry-dragging");
+      if (drag.moved) {
+        this.#place(snapEntryPosition(this.#position, this.#viewport()));
+        this.#opts.savePosition({ ...this.#position });
+      }
+      if (this.#btn.hasPointerCapture(event.pointerId)) this.#btn.releasePointerCapture(event.pointerId);
+      event.stopPropagation();
+    }
+    #onResize = () => {
+      if (!this.#drag) this.#place(restoreEntryPosition(this.#position, this.#viewport()));
+    };
     show() {
-      if (!this.#host.isConnected) document.documentElement.appendChild(this.#host);
+      if (this.#host.isConnected) return;
+      document.documentElement.appendChild(this.#host);
+      this.#place(restoreEntryPosition(this.#opts.loadPosition(), this.#viewport()));
+      window.addEventListener("resize", this.#onResize);
+      this.#visualViewport = window.visualViewport;
+      this.#visualViewport?.addEventListener("resize", this.#onResize);
+      this.#visualViewport?.addEventListener("scroll", this.#onResize);
     }
     hide() {
+      if (!this.#host.isConnected) return;
+      window.removeEventListener("resize", this.#onResize);
+      this.#visualViewport?.removeEventListener("resize", this.#onResize);
+      this.#visualViewport?.removeEventListener("scroll", this.#onResize);
+      this.#visualViewport = null;
+      this.#drag = null;
+      this.#btn.classList.remove("myr-entry-dragging");
       this.#host.remove();
     }
   }
@@ -5103,7 +5689,15 @@ ${comic.detailUrl}`)}`;
       const bus = new CaptureBus();
       bus.start();
       const adapter = createMangayunAdapter(bus);
-      const app = createReaderApp({ adapter, kv });
+      const entryRef = {};
+      const app = createReaderApp({
+        adapter,
+        kv,
+        onReaderActiveChange: (active) => {
+          if (active) entryRef.current?.hide();
+          else if (adapter.currentReadRoute()) entryRef.current?.show();
+        }
+      });
       const { controller, ui, settingsStore } = app;
       const entry = new FloatingEntry({
         onTap: () => {
@@ -5113,16 +5707,19 @@ ${comic.detailUrl}`)}`;
         loadPosition: () => settingsStore.get().floatPos,
         savePosition: (pos) => settingsStore.update({ floatPos: pos })
       });
+      entryRef.current = entry;
       function syncRoute() {
         const route = adapter.currentReadRoute();
         if (route && !controller.active) {
-          entry.show();
+          entry?.show();
           ui.setCurrentChapter(route.chapterUrl);
           const settings = settingsStore.effective(route.comic);
           if (settings.autoEnter) void controller.enter(route);
         } else if (!route) {
-          entry.hide();
+          entry?.hide();
           if (controller.active) controller.exit();
+        } else {
+          entry?.hide();
         }
       }
       let returning = false;

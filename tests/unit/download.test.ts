@@ -1,10 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import packageJson from '../../package.json'
 import { finalizeImageUrl, isProxiedUrl, isScrambledImage, supportOf, VERIFIED_SOURCES } from '../../src/site/mangayun/images'
 import { validateImageBytes, parseRetryAfter, FetchFailure } from '../../src/download/fetcher'
-import { buildReport, zipFileName } from '../../src/download/packer'
+import { buildReport, MemorySink, opfsSink, packToSink, zipFileName, type PackInput } from '../../src/download/packer'
 import { newTask, taskStats } from '../../src/download/task'
 import { MemoryCache, MEMORY_MODE_CAP_MIB } from '../../src/download/cache'
 import type { Chapter } from '../../src/site/types'
+import { readStoredZip } from './archive-test-helpers'
+
+async function sinkBytes(sink: MemorySink): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsArrayBuffer(sink.toBlob())
+  })
+}
 
 const BASE = 'https://mangayun.com'
 
@@ -112,6 +123,7 @@ describe('packer（R-D5、R-D9 报告）', () => {
     expect(report.chapters[0]!.savedPages).toBe(2)
     expect(report.chapters[0]!.missing).toEqual([{ page: 2, reason: 'fetch-failed', attempts: 3 }])
     expect(report.site.verified).toBe(false)
+    expect(report.version).toBe(packageJson.version)
   })
 
   it('完整任务 result=complete', () => {
@@ -129,7 +141,122 @@ describe('packer（R-D5、R-D9 报告）', () => {
 
   it('zip 文件名与 _partial（R-D9）', () => {
     expect(zipFileName('测试', false)).toBe('测试.zip')
-    expect(zipFileName('测试', true)).toBe('测试.zip_partial')
+    expect(zipFileName('测试', true)).toBe('测试_partial.zip')
+  })
+
+  it('导出页名从 0001 开始，保留目录序号与报告页号', async () => {
+    const input: PackInput = {
+      ref: { siteId: 'manhuazhijia', detailUrl: 'https://x/c' },
+      title: '测试漫画',
+      partial: false,
+      siteVerified: true,
+      chapters: [
+        {
+          chapter: chapter(1, '第1话', 0),
+          expectedPages: 2,
+          pages: [
+            { page: 0, ext: 'jpg', bytes: new Uint8Array([1]) },
+            { page: 1, ext: 'png', bytes: new Uint8Array([2]) },
+          ],
+        },
+        {
+          chapter: chapter(3, '第3话', 2),
+          expectedPages: 1,
+          pages: [{ page: 0, ext: 'webp', bytes: new Uint8Array([3]) }],
+        },
+      ],
+    }
+    const sink = new MemorySink()
+    const result = await packToSink(sink, input, async () => null, () => 'unused')
+    const output = await sinkBytes(sink)
+    const archive = readStoredZip(output)
+    const names = archive.entries.map((entry) => entry.name)
+    expect(names).toEqual([
+      '测试漫画/0001_第1话/0001.jpg',
+      '测试漫画/0001_第1话/0002.png',
+      '测试漫画/0003_第3话/0001.webp',
+      '测试漫画/download-report.json',
+    ])
+    expect(names.some((name) => /\/(0000)\./.test(name))).toBe(false)
+    expect(result.entryCount).toBe(4)
+    expect(result.byteLength).toBe(output.length)
+    expect(sink.byteLength).toBe(output.length)
+    expect(result.report.result).toBe('complete')
+    expect(result.report.version).toBe(packageJson.version)
+    expect(result.report.chapters.map((c) => [c.order, c.rawIndex, c.savedPages])).toEqual([
+      [1, 0, 2],
+      [3, 2, 1],
+    ])
+    const archivedReport = JSON.parse(
+      new TextDecoder().decode(archive.entries.at(-1)!.data),
+    ) as typeof result.report
+    expect(archivedReport).toEqual(result.report)
+  })
+
+  it('缓存页缺失时打包失败，不生成看似完整的报告', async () => {
+    const input: PackInput = {
+      ref: { siteId: 'manhuazhijia', detailUrl: 'https://x/c' },
+      title: '测试漫画',
+      partial: false,
+      siteVerified: true,
+      chapters: [
+        {
+          chapter: chapter(1, '第1话', 0),
+          expectedPages: 1,
+          pages: [{ page: 0, ext: 'jpg' }],
+        },
+      ],
+    }
+    const sink = new MemorySink()
+    await expect(
+      packToSink(sink, input, async () => null, () => 'missing'),
+    ).rejects.toThrow(/missing cached page/i)
+    expect(sink.byteLength).toBe(0)
+  })
+
+  it('aborts an OPFS writable when packing fails partway through', async () => {
+    const writable = { write: vi.fn(async () => {}), close: vi.fn(async () => {}), abort: vi.fn(async () => {}) }
+    const input: PackInput = {
+      ref: { siteId: 'test', detailUrl: 'https://example.test/comic' }, title: 'Test', partial: false, siteVerified: false,
+      chapters: [{ chapter: chapter(1, 'Chapter', 0), expectedPages: 2, pages: [
+        { page: 0, ext: 'png', bytes: new Uint8Array([1]) }, { page: 1, ext: 'png' },
+      ] }],
+    }
+    await expect(packToSink(opfsSink(writable as unknown as FileSystemWritableFileStream), input, async () => null, () => 'missing'))
+      .rejects.toThrow('missing cached page')
+    expect(writable.write).toHaveBeenCalled()
+    expect(writable.abort).toHaveBeenCalledTimes(1)
+    expect(writable.close).not.toHaveBeenCalled()
+  })
+
+  it('已知失败页可导出部分结果，但报告标记 partial', async () => {
+    const input: PackInput = {
+      ref: { siteId: 'manhuazhijia', detailUrl: 'https://x/c' },
+      title: '测试漫画',
+      partial: true,
+      siteVerified: true,
+      chapters: [
+        {
+          chapter: chapter(1, '第1话', 0),
+          expectedPages: 2,
+          pages: [
+            { page: 0, ext: 'jpg', bytes: new Uint8Array([1]) },
+            { page: 1, ext: null },
+          ],
+        },
+      ],
+    }
+    const sink = new MemorySink()
+    const result = await packToSink(sink, input, async () => null, () => 'unused')
+    const archive = readStoredZip(await sinkBytes(sink))
+    expect(archive.entries.map((entry) => entry.name)).toEqual([
+      '测试漫画/0001_第1话/0001.jpg',
+      '测试漫画/download-report.json',
+    ])
+    expect(result.report.result).toBe('partial')
+    expect(result.report.chapters[0]!.missing).toEqual([
+      { page: 2, reason: 'fetch-failed', attempts: 3 },
+    ])
   })
 })
 

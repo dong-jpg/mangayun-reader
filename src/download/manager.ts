@@ -65,6 +65,7 @@ export class DownloadManager {
   #speedWindow: { at: number; bytes: number }[] = []
   #pack: PackHandle | null = null
   #running = false
+  #lockedTaskId: string | null = null
 
   constructor(deps: ManagerDeps) {
     this.#deps = deps
@@ -128,42 +129,61 @@ export class DownloadManager {
 
   /** 恢复任务（R-D13）：已缓存页跳过，其余重新解析后下载。 */
   async resume(taskId: string): Promise<boolean> {
+    if (this.#running || this.#lockedTaskId) return false
     const cached = loadTask(this.#deps.kv, taskId)
     if (!cached) return false
-    const cache = await this.ensureCache()
-    cached.storage = cache.kind
-    cached.state = 'resolving'
-    cached.note = null
-    // 校验已缓存页：缓存损坏的回退为 pending
-    for (const [ci, c] of cached.chapters.entries()) {
-      for (let p = 0; p < c.pages.length; p++) {
-        if (c.pages[p] === 'cached') {
-          const hit = await cache.get(this.cacheKeyOf(taskId, ci, p))
-          if (!hit) c.pages[p] = 'pending'
-        }
-      }
-      c.failures = []
-    }
     this.#task = cached
+    this.#pack = null
     this.#abort = false
     this.#userPaused = false
-    saveTask(this.#deps.kv, cached)
-    void this.#run(cached)
+    void this.#run(cached, async () => {
+      const latest = loadTask(this.#deps.kv, taskId)
+      if (!latest) throw new Error('任务不存在或已清理')
+      Object.assign(cached, latest)
+      const cache = await this.ensureCache()
+      cached.storage = cache.kind
+      cached.state = 'resolving'
+      cached.note = null
+      // Validate and update shared metadata only after owning the task lock.
+      for (const [ci, c] of cached.chapters.entries()) {
+        for (let p = 0; p < c.pages.length; p++) {
+          if (c.pages[p] === 'cached' && !(await cache.get(this.cacheKeyOf(taskId, ci, p)))) c.pages[p] = 'pending'
+        }
+        c.failures = []
+      }
+      saveTask(this.#deps.kv, cached)
+    })
     return true
   }
 
-  async #run(task: DownloadTaskData): Promise<void> {
+  async #run(task: DownloadTaskData, prepare?: () => Promise<void>): Promise<void> {
     if (this.#running) return
     this.#running = true
     try {
       // R-D14：同一任务同时只有一个标签页在执行
-      const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => this.#runInner(task))
+      const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => {
+        this.#lockedTaskId = task.id
+        try {
+          await prepare?.()
+          await this.#runInner(task)
+        } catch (error) {
+          task.state = 'failed'
+          task.note = error instanceof Error ? error.message : String(error)
+          saveTask(this.#deps.kv, task)
+          this.#emit()
+        } finally {
+          this.#lockedTaskId = null
+        }
+      })
       if (!outcome.acquired) {
         task.state = 'paused'
         task.note = '另一个标签页正在执行本任务'
-        saveTask(this.#deps.kv, task)
         this.#emit()
       }
+    } catch (error) {
+      task.state = 'failed'
+      task.note = error instanceof Error ? error.message : String(error)
+      this.#emit()
     } finally {
       this.#running = false
     }
@@ -239,6 +259,7 @@ export class DownloadManager {
                   } catch (e) {
                     if (e instanceof MemoryCapError) {
                       capHit = true
+                      scheduler.cancel()
                       throw e
                     }
                     throw e
@@ -347,16 +368,15 @@ export class DownloadManager {
   }
 
   resumePaused(): void {
+    const task = this.#task
+    if (!task) return
+    if (!this.#running) { void this.resume(task.id); return }
+    if (this.#lockedTaskId !== task.id) return
     this.#userPaused = false
     this.#scheduler?.resume()
-    if (this.#task) {
-      const task = this.#task
-      task.note = null
-      saveTask(this.#deps.kv, task)
-      // 若运行循环已退出（暂停在章节边界），重新驱动
-      if (!this.#running) void this.#run(task)
-      this.#emit()
-    }
+    task.note = null
+    saveTask(this.#deps.kv, task)
+    this.#emit()
   }
 
   cancel(): void {
@@ -374,6 +394,8 @@ export class DownloadManager {
   async retryFailed(): Promise<void> {
     const task = this.#task
     if (!task) return
+    if (!this.#running) { await this.resume(task.id); return }
+    if (this.#lockedTaskId !== task.id) return
     for (const c of task.chapters) {
       c.failures = []
       for (let p = 0; p < c.pages.length; p++) {
@@ -386,7 +408,6 @@ export class DownloadManager {
     saveTask(this.#deps.kv, task)
     this.#abort = false
     this.#userPaused = false
-    if (!this.#running) void this.#run(task)
     this.#emit()
   }
 
@@ -394,67 +415,95 @@ export class DownloadManager {
   async pack(partial: boolean): Promise<PackHandle> {
     const task = this.#task
     if (!task) throw new Error('没有进行中的任务')
-    const cache = await this.ensureCache()
-    task.state = 'packing'
-    saveTask(this.#deps.kv, task)
-    this.#emit()
-    const input = {
-      ref: task.ref,
-      title: task.title,
-      partial,
-      siteVerified: VERIFIED_SOURCES.has(task.ref.siteId),
-      chapters: task.chapters.map((c) => ({
-        chapter: c.chapter,
-        expectedPages: c.expectedPages,
-        pages: c.pages.map((status, page) => ({
-          page,
-          ext: status === 'cached' ? c.exts[page] ?? 'jpg' : null,
-        })),
-      })),
+    this.#pack = null
+    if (this.#lockedTaskId === task.id) return this.#packTask(task, partial)
+    const outcome = await withTabLock(`myr:v1:lock:${task.id}`, async () => {
+      this.#lockedTaskId = task.id
+      try { return await this.#packTask(task, partial) }
+      finally { this.#lockedTaskId = null }
+    })
+    if (!outcome.acquired) {
+      task.state = 'paused'
+      task.note = '另一个标签页正在执行本任务'
+      this.#emit()
+      throw new Error(task.note)
     }
-    const keyOf = (ci: number, page: number) => this.cacheKeyOf(task.id, ci, page)
+    return outcome.result!
+  }
 
-    let handle: PackHandle
-    if (cache.kind === 'opfs') {
-      const root = await navigator.storage.getDirectory()
-      const ns = await root.getDirectoryHandle('myr-v1', { create: true })
-      const zips = await ns.getDirectoryHandle('zips', { create: true })
-      const fileHandle = await zips.getFileHandle(`${task.id}.zip`, { create: true })
-      const writable = await fileHandle.createWritable()
-      const result = await packToSink(opfsSink(writable), input, (key) =>
-        cache.get(key).then((c) => c?.bytes ?? null),
-        keyOf,
-      )
-      handle = {
-        taskId: task.id,
-        fileName: zipFileName(task.title, partial),
-        byteLength: result.byteLength,
-        file: await fileHandle.getFile(),
-        blob: null,
-        report: result.report,
-      }
-    } else {
-      const sink = new MemorySink()
-      const result = await packToSink(sink, input, (key) =>
-        cache.get(key).then((c) => c?.bytes ?? null),
-        keyOf,
-      )
-      handle = {
-        taskId: task.id,
-        fileName: zipFileName(task.title, partial),
-        byteLength: result.byteLength,
-        file: null,
-        blob: sink.toBlob(),
-        report: result.report,
-      }
-    }
-    task.state = 'packed'
-    task.zipName = handle.fileName
+  async #packTask(task: DownloadTaskData, partial: boolean): Promise<PackHandle> {
+    this.#pack = null
+    task.state = 'packing'
+    task.note = null
     saveTask(this.#deps.kv, task)
-    this.#pack = handle
     this.#emit()
-    this.#deps.onPacked(handle)
-    return handle
+    try {
+      const cache = await this.ensureCache()
+      const input = {
+        ref: task.ref,
+        title: task.title,
+        partial,
+        siteVerified: VERIFIED_SOURCES.has(task.ref.siteId),
+        chapters: task.chapters.map((c) => ({
+          chapter: c.chapter,
+          expectedPages: c.expectedPages,
+          pages: c.pages.map((status, page) => ({
+            page,
+            ext: status === 'cached' ? c.exts[page] ?? 'jpg' : null,
+          })),
+        })),
+      }
+      const keyOf = (ci: number, page: number) => this.cacheKeyOf(task.id, ci, page)
+
+      let handle: PackHandle
+      if (cache.kind === 'opfs') {
+        const root = await navigator.storage.getDirectory()
+        const ns = await root.getDirectoryHandle('myr-v1', { create: true })
+        const zips = await ns.getDirectoryHandle('zips', { create: true })
+        const fileHandle = await zips.getFileHandle(`${task.id}.zip`, { create: true })
+        const writable = await fileHandle.createWritable()
+        const result = await packToSink(opfsSink(writable), input, (key) =>
+          cache.get(key).then((c) => c?.bytes ?? null),
+          keyOf,
+        )
+        handle = {
+          taskId: task.id,
+          fileName: zipFileName(task.title, partial),
+          byteLength: result.byteLength,
+          file: await fileHandle.getFile(),
+          blob: null,
+          report: result.report,
+        }
+      } else {
+        const sink = new MemorySink()
+        const result = await packToSink(sink, input, (key) =>
+          cache.get(key).then((c) => c?.bytes ?? null),
+          keyOf,
+        )
+        handle = {
+          taskId: task.id,
+          fileName: zipFileName(task.title, partial),
+          byteLength: result.byteLength,
+          file: null,
+          blob: sink.toBlob(),
+          report: result.report,
+        }
+      }
+      task.state = 'packed'
+      task.zipName = handle.fileName
+      saveTask(this.#deps.kv, task)
+      this.#pack = handle
+      this.#emit()
+      this.#deps.onPacked(handle)
+      return handle
+    } catch (error) {
+      this.#pack = null
+      task.state = 'failed'
+      task.note = error instanceof Error ? error.message : String(error)
+      saveTask(this.#deps.kv, task)
+      this.#emit()
+      throw error
+    }
   }
 
   markHandedOff(): void {

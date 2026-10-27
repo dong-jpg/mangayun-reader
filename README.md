@@ -4,10 +4,10 @@
 
 ## 项目状态
 
-首版（v1.0.0）已实现：三种阅读模式、手势与点击区、进度记忆、单话/多话/整部下载（一个 ZIP）。
-单元测试 113 项、Playwright e2e 9 项全部通过（Pixel 7 视口 + 触摸仿真，基于本地 harness 页）；
-[samples/](samples/) 内含两个由真实下载流水线生成并经 PowerShell 独立解包核验的样本 ZIP（单话 + 跳选多话，跳选保持全局序号）。
-**安卓真机清单（方案 §6.5）尚未执行**，模板见 [docs/specs/device-checklist.md](docs/specs/device-checklist.md)，交付验收前需逐项确认。
+当前发布基线：v1.1.1，包含三种阅读模式、手势与点击区、进度记忆、单话/多话/整部下载（一个 ZIP），以及移动端入口和分组设置面板。
+自动化验证覆盖单元测试和 Playwright 触屏视口（Pixel 7 模拟）与本地 harness；这不代表安卓真机验收。
+`samples/` 中的单话 ZIP 与跳选第 1、3 话 ZIP 经 Python 标准库独立核验（结构、CRC、STORE 压缩方式、页码和报告一致）。
+**安卓真机清单（方案 §6.5）尚未完成。T1–T19 未测或缺设备证据均不得视为通过**，详见 [docs/specs/device-checklist.md](docs/specs/device-checklist.md)。
 
 ## 安装
 
@@ -23,7 +23,7 @@
 - 目录跳转（正序/倒序）、页码与进度滑块、全屏、背景色、屏幕常亮、章首/章尾切话卡片、键盘操作。
 - 下载当前话/勾选多话/整部 → 单个 ZIP（STORE 不压缩），文件夹与页序按目录正序编号（至少 4 位），扩展名按文件头判定，
   含 `download-report.json`；支持暂停/继续/取消、有限重试（1s/3s+抖动）、429/503 限流退避（遵守 Retry-After）、
-  失败清单与部分导出（`_partial`）、刷新后恢复任务（不重复下载）、Web Locks 单标签页执行。
+ 失败清单与部分导出（`_partial.zip`）、刷新后恢复任务（不重复下载）、Web Locks 单标签页执行。
 - 存储：OPFS 流式 → IndexedDB → 内存模式（上限 100 MiB）逐级回退。
 
 ## 权限说明
@@ -44,6 +44,7 @@
 npm install
 npm run dev            # 用户脚本开发模式（Tampermonkey 指向本地）
 npm run build          # 构建 dist/mangayun-reader.user.js
+npm run verify:samples # 使用 Python 3 独立核验样本 ZIP
 npm test               # 单元测试（Vitest + jsdom）
 npm run e2e            # Playwright e2e（自动构建并预览 harness 页）
 npm run typecheck      # tsc --noEmit（strict）
@@ -53,6 +54,8 @@ npm run build:harness  # 构建 harness 验收页
 
 harness（`harness/`）是不访问真实站点的本地验收页：mock 适配器 + 服务端确定性生成 PNG +
 故障注入端点（404、429+Retry-After、HTML 伪装、过期后重解析），驱动与用户脚本完全相同的 app 装配（`src/app.ts`）。
+
+样本由 `npm run samples` 生成。Python 3 是样本独立核验所需工具；验收会核对 ZIP 中央目录、每个条目的 CRC、图片格式、页序、报告与文件一致性。
 
 ## 文档
 
