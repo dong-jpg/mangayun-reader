@@ -8,7 +8,7 @@
 | 安卓版本 | 未测 |
 | 浏览器及版本 | 未测 |
 | Tampermonkey 版本 | 未测 |
-| 安装产物版本 | dist/mangayun-reader.user.js @ v1.1.1；commit 待发布 |
+| 安装产物版本 | dist/mangayun-reader.user.js @ v1.2.0；commit 待发布 |
 
 结果填「通过」「失败」或「未测」，失败项附截图或录屏。任一 P0 失败按 §6.3 不通过；「未测」不算通过。
 

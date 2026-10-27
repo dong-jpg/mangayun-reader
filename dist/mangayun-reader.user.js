@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MangaYun Reader
 // @namespace    https://github.com/dong-jpg/mangayun-reader
-// @version      1.1.1
+// @version      1.2.0
 // @author       dong-jpg
 // @description  云漫增强阅读器：横向/纵向连续、单页模式、进度记忆、章节下载（ZIP）
 // @license      MIT
@@ -1230,6 +1230,7 @@ ${comic.detailUrl}`)}`;
         img.decoding = "async";
         img.referrerPolicy = "no-referrer";
         img.loading = "eager";
+        img.draggable = false;
         slot.appendChild(img);
         this.slots.push(slot);
         this.imgs.push(img);
@@ -1424,6 +1425,8 @@ ${comic.detailUrl}`)}`;
     win;
     gesture;
     #lastAnchor = null;
+    #mouseDrag = null;
+    #dragMoved = false;
     constructor(options) {
       this.host = options.host;
       this.axis = options.axis;
@@ -1476,6 +1479,26 @@ ${comic.detailUrl}`)}`;
           this.host.onAnchorChange(a);
         });
       });
+      if (this.axis === "x") {
+        let lastWheelAt = 0;
+        let wheelAccum = 0;
+        this.cleanup.addListener(this.scroller, "wheel", (e) => {
+          const we = e;
+          if (we.deltaX !== 0) return;
+          if (we.ctrlKey) return;
+          const now = we.timeStamp;
+          if (now - lastWheelAt > 80) wheelAccum = 0;
+          lastWheelAt = now;
+          wheelAccum += Math.abs(we.deltaY);
+          e.preventDefault();
+          if (wheelAccum >= 40) {
+            const dir = we.deltaY > 0 ? 1 : -1;
+            const n = Math.min(3, Math.floor(wheelAccum / 40));
+            wheelAccum -= n * 40;
+            for (let i = 0; i < n; i++) this.step(dir);
+          }
+        }, { passive: false });
+      }
       let lastW = window.innerWidth;
       let lastH = window.innerHeight;
       const onResize = () => {
@@ -1509,10 +1532,37 @@ ${comic.detailUrl}`)}`;
       this.cleanup.addListener(this.scroller, "pointercancel", onPointer((e) => {
         this.gesture.pointerCancel(e.pointerId);
       }));
+      this.cleanup.addListener(this.scroller, "pointerdown", onPointer((e) => {
+        if (e.pointerType !== "mouse" || e.button !== 0) return;
+        this.#mouseDrag = { x: e.clientX, y: e.clientY };
+      }));
+      this.cleanup.addListener(this.scroller, "pointermove", onPointer((e) => {
+        if (e.pointerType !== "mouse" || !this.#mouseDrag) return;
+        const dx = e.clientX - this.#mouseDrag.x;
+        const dy = e.clientY - this.#mouseDrag.y;
+        if (dx === 0 && dy === 0) return;
+        this.#mouseDrag = { x: e.clientX, y: e.clientY };
+        if (Math.hypot(dx, dy) >= 4) this.#dragMoved = true;
+        if (this.axis === "y") this.scroller.scrollBy({ top: -dy });
+        else this.scroller.scrollBy({ left: -dx });
+      }));
+      const endDrag = onPointer((e) => {
+        if (e.pointerType !== "mouse") return;
+        this.#mouseDrag = null;
+      });
+      this.cleanup.addListener(this.scroller, "pointerup", endDrag);
+      this.cleanup.addListener(this.scroller, "pointercancel", endDrag);
+      this.cleanup.addListener(this.scroller, "click", (e) => {
+        if (this.#dragMoved) {
+          this.#dragMoved = false;
+          e.stopPropagation();
+          return;
+        }
+        stopper(e);
+      });
       this.cleanup.addListener(this.scroller, "touchstart", stopper, { passive: true });
       this.cleanup.addListener(this.scroller, "touchmove", stopper, { passive: true });
       this.cleanup.addListener(this.scroller, "touchend", stopper, { passive: true });
-      this.cleanup.addListener(this.scroller, "click", stopper);
       this.cleanup.addListener(this.scroller, "contextmenu", stopper);
       requestAnimationFrame(() => {
         this.goTo(anchor.page, anchor.offset);
@@ -1738,6 +1788,11 @@ ${comic.detailUrl}`)}`;
     #ty = 0;
     #pointers = /* @__PURE__ */ new Map();
     #pinchStart = null;
+    #mouseDrag = null;
+    #dragStart = null;
+    #dragTranslate = null;
+    #lastWheelAt = 0;
+    #wheelAccum = 0;
     constructor(host) {
       this.#host = host;
     }
@@ -1772,6 +1827,70 @@ ${comic.detailUrl}`)}`;
           this.#trackPointer(type, e);
         });
       }
+      this.#cleanup.addListener(this.#stage, "pointerdown", (e) => {
+        const pe = e;
+        if (pe.pointerType !== "mouse" || pe.button !== 0) return;
+        this.#mouseDrag = { x: pe.clientX, y: pe.clientY, moved: false };
+        this.#dragStart = { x: pe.clientX, y: pe.clientY, t: pe.timeStamp };
+      });
+      this.#cleanup.addListener(this.#stage, "pointermove", (e) => {
+        const pe = e;
+        if (pe.pointerType !== "mouse" || !this.#mouseDrag) return;
+        const dx = pe.clientX - this.#mouseDrag.x;
+        const dy = pe.clientY - this.#mouseDrag.y;
+        this.#mouseDrag = { x: pe.clientX, y: pe.clientY, moved: true };
+        if (this.isZoomed()) {
+          this.#pan(dx, dy);
+        } else if (Math.hypot(pe.clientX - (this.#dragStart?.x ?? pe.clientX), pe.clientY - (this.#dragStart?.y ?? pe.clientY)) >= 10) {
+          this.#dragTranslate = (this.#dragTranslate ?? 0) + dx;
+          this.#applyDragTranslate();
+        }
+      });
+      const endMouseDrag = (e) => {
+        const pe = e;
+        if (pe.pointerType !== "mouse" || !this.#mouseDrag) return;
+        this.#mouseDrag = null;
+        this.#dragTranslate = null;
+        if (this.#dragStart) {
+          const totalDx = pe.clientX - this.#dragStart.x;
+          const totalDy = pe.clientY - this.#dragStart.y;
+          const dur = Math.max(1, pe.timeStamp - this.#dragStart.t);
+          const velocity = Math.hypot(totalDx, totalDy) / dur;
+          this.#dragStart = null;
+          if (!this.isZoomed()) {
+            const ax = Math.abs(totalDx);
+            const ay = Math.abs(totalDy);
+            if (ax > ay * 1.5 && (ax >= this.#stage.getBoundingClientRect().width * 0.15 || velocity >= 0.5)) {
+              this.#applyDragTranslate(0);
+              this.#handleSwipe(totalDx < 0 ? "left" : "right");
+              return;
+            }
+          }
+        }
+        this.#applyDragTranslate(0);
+      };
+      this.#cleanup.addListener(this.#stage, "pointerup", endMouseDrag);
+      this.#cleanup.addListener(this.#stage, "pointercancel", endMouseDrag);
+      this.#cleanup.addListener(this.#stage, "wheel", (e) => {
+        const we = e;
+        if (we.ctrlKey) return;
+        if (we.deltaX !== 0 && we.deltaY === 0) {
+          e.preventDefault();
+          this.step(we.deltaX < 0 ? this.#host.settings.direction === "rtl" ? -1 : 1 : this.#host.settings.direction === "rtl" ? 1 : -1);
+          return;
+        }
+        e.preventDefault();
+        const dir = we.deltaY > 0 ? 1 : -1;
+        const now = we.timeStamp;
+        if (now - this.#lastWheelAt > 80) this.#wheelAccum = 0;
+        this.#lastWheelAt = now;
+        this.#wheelAccum += Math.abs(we.deltaY);
+        if (this.#wheelAccum >= 40) {
+          const n = Math.min(3, Math.floor(this.#wheelAccum / 40));
+          this.#wheelAccum -= n * 40;
+          for (let i = 0; i < n; i++) this.step(dir);
+        }
+      }, { passive: false });
       this.#cleanup.addListener(this.#stage, "click", (e) => e.stopPropagation());
       this.#cleanup.addListener(this.#stage, "contextmenu", (e) => e.stopPropagation());
       const onResize = () => {
@@ -1848,6 +1967,10 @@ ${comic.detailUrl}`)}`;
       this.#viewport.style.transform = `translate(${this.#tx}px, ${this.#ty}px) scale(${this.#scale})`;
       if (this.#scale <= 1.01) this.#viewport.classList.remove("myr-zoomed");
       else this.#viewport.classList.add("myr-zoomed");
+    }
+    /** 鼠标拖动跟手位移（非放大态的临时视觉反馈，释放后归零）。 */
+    #applyDragTranslate(px = this.#dragTranslate ?? 0) {
+      this.#viewport.style.translate = px !== 0 ? `${px}px` : "";
     }
     #handleTap(x, y) {
       const rect = this.#stage.getBoundingClientRect();
@@ -2529,6 +2652,8 @@ ${comic.detailUrl}`)}`;
   color: #eee; user-select: none; -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
+/* 桌面鼠标拖动翻页：图片原生 draggable 会把拖动变成 drag-and-drop（吞 pointermove），关掉 */
+.myr-root img { -webkit-user-drag: none; user-drag: none }
 .myr-root.myr-open { display: block }
 .myr-bg-black { background: #000 }
 .myr-bg-gray { background: #3f3f46 }
@@ -2821,7 +2946,7 @@ ${SETTINGS_STYLES}
     }
     return el2;
   }
-  const version = "1.1.1";
+  const version = "1.2.0";
   const PATHS = {
     book: "M12 5.5C9 3.8 5.5 3.5 3 4.5v14c3-1 6.5-.5 9 1 2.5-1.5 6-2 9-1v-14c-2.5-1-6-.7-9 1Zm0 0v14M6 8l3 .5M6 11l3 .5M15 8.5l3-.5M15 11.5l3-.5",
     vertical: "M5 3h14v5H5zM5 12h14v5H5zM9 21h6",

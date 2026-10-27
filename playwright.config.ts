@@ -19,5 +19,22 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     timeout: 180_000,
   },
-  projects: [{ name: 'mobile-chromium', use: { ...devices['Pixel 7'] } }],
+  projects: [
+    // 桌面输入用例只在 desktop-chromium 跑：isMobile 仿真会把 wheel 合成为触摸手势
+    {
+      name: 'mobile-chromium',
+      testIgnore: /desktop-input.*\.spec\.ts/,
+      use: { ...devices['Pixel 7'] },
+    },
+    {
+      name: 'desktop-chromium',
+      testMatch: /desktop-input.*\.spec\.ts/,
+      use: {
+        browserName: 'chromium',
+        viewport: { width: 1280, height: 800 },
+        hasTouch: false,
+        isMobile: false,
+      },
+    },
+  ],
 })

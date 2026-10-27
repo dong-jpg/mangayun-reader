@@ -26,6 +26,8 @@ export const STYLES = `
   color: #eee; user-select: none; -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
 }
+/* 桌面鼠标拖动翻页：图片原生 draggable 会把拖动变成 drag-and-drop（吞 pointermove），关掉 */
+.myr-root img { -webkit-user-drag: none; user-drag: none }
 .myr-root.myr-open { display: block }
 .myr-bg-black { background: #000 }
 .myr-bg-gray { background: #3f3f46 }

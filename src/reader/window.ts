@@ -52,6 +52,8 @@ export class PageWindow {
       img.decoding = 'async'
       img.referrerPolicy = 'no-referrer'
       img.loading = 'eager'
+      // 桌面鼠标按住拖动翻页：禁掉图片原生拖拽（否则 pointermove 被拖放协议吞掉）
+      img.draggable = false
       slot.appendChild(img)
       this.slots.push(slot)
       this.imgs.push(img)

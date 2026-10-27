@@ -24,6 +24,8 @@ export abstract class ContinuousMode implements ReaderMode {
   protected win!: PageWindow
   protected gesture!: GestureRecognizer
   #lastAnchor: { page: number; offset: number } | null = null
+  #mouseDrag: { x: number; y: number } | null = null
+  #dragMoved = false
 
   constructor(options: ContinuousOptions) {
     this.host = options.host
@@ -89,6 +91,31 @@ export abstract class ContinuousMode implements ReaderMode {
       })
     })
 
+    // 桌面滚轮（§1.1 桌面可用）：纵向模式原生滚动即可；
+    // 横向模式垂直滚轮没有对应轴，转为翻行（每个 wheel 事件滚 ~1 行，
+    // 用事件间时间间隔区分：滚轮一格是离散事件（≥80ms 间隔），触控板是高频连续流）
+    if (this.axis === 'x') {
+      let lastWheelAt = 0
+      let wheelAccum = 0
+      this.cleanup.addListener(this.scroller, 'wheel', (e: Event) => {
+        const we = e as WheelEvent
+        if (we.deltaX !== 0) return // 已有横轴（shift+滚轮/触控板横滑）交给原生
+        if (we.ctrlKey) return // 触控板捏合缩放事件，不处理
+        const now = we.timeStamp
+        if (now - lastWheelAt > 80) wheelAccum = 0 // 新的一格（离散滚轮）
+        lastWheelAt = now
+        wheelAccum += Math.abs(we.deltaY)
+        e.preventDefault()
+        if (wheelAccum >= 40) {
+          // 一格滚轮（无论 OS 换算成 40~120px）至少一行；高频触控板流按累积折算
+          const dir = we.deltaY > 0 ? 1 : -1
+          const n = Math.min(3, Math.floor(wheelAccum / 40))
+          wheelAccum -= n * 40
+          for (let i = 0; i < n; i++) this.step(dir)
+        }
+      }, { passive: false })
+    }
+
     // 尺寸变化 → 先让子类重算布局（如横向适配切换），再按最近上报锚点恢复。
     // 守卫：安卓 Chrome 滑动时地址栏收展/双指缩放会触发 visualViewport 事件，
     // 高度抖动 <150px 或纯缩放（innerWidth 不变）不重排，避免与手势打架造成闪跳。
@@ -127,11 +154,40 @@ export abstract class ContinuousMode implements ReaderMode {
     this.cleanup.addListener(this.scroller, 'pointercancel', onPointer((e) => {
       this.gesture.pointerCancel(e.pointerId)
     }))
+    // 桌面鼠标按住拖动（触摸有原生 pan，鼠标没有）：pointerType=mouse 时把位移转成滚动
+    this.cleanup.addListener(this.scroller, 'pointerdown', onPointer((e) => {
+      if (e.pointerType !== 'mouse' || e.button !== 0) return
+      this.#mouseDrag = { x: e.clientX, y: e.clientY }
+    }))
+    this.cleanup.addListener(this.scroller, 'pointermove', onPointer((e) => {
+      if (e.pointerType !== 'mouse' || !this.#mouseDrag) return
+      const dx = e.clientX - this.#mouseDrag.x
+      const dy = e.clientY - this.#mouseDrag.y
+      if (dx === 0 && dy === 0) return
+      this.#mouseDrag = { x: e.clientX, y: e.clientY }
+      if (Math.hypot(dx, dy) >= 4) this.#dragMoved = true
+      if (this.axis === 'y') this.scroller.scrollBy({ top: -dy })
+      else this.scroller.scrollBy({ left: -dx })
+    }))
+    const endDrag = onPointer((e) => {
+      if (e.pointerType !== 'mouse') return
+      this.#mouseDrag = null
+    })
+    this.cleanup.addListener(this.scroller, 'pointerup', endDrag)
+    this.cleanup.addListener(this.scroller, 'pointercancel', endDrag)
+    // 鼠标拖动释放后不触发点击区（拖动期间原 click 监听吞掉）
+    this.cleanup.addListener(this.scroller, 'click', (e: Event) => {
+      if (this.#dragMoved) {
+        this.#dragMoved = false
+        e.stopPropagation()
+        return
+      }
+      stopper(e)
+    })
     // 阻断冒泡，避免原站挂在 document/window 的监听收到（§4.4 事件与路由）
     this.cleanup.addListener(this.scroller, 'touchstart', stopper, { passive: true })
     this.cleanup.addListener(this.scroller, 'touchmove', stopper, { passive: true })
     this.cleanup.addListener(this.scroller, 'touchend', stopper, { passive: true })
-    this.cleanup.addListener(this.scroller, 'click', stopper)
     this.cleanup.addListener(this.scroller, 'contextmenu', stopper)
 
     // 首帧挂载后恢复锚点

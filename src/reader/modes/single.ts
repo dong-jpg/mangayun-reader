@@ -25,6 +25,11 @@ export class SingleMode implements ReaderMode {
   #ty = 0
   #pointers = new Map<number, { x: number; y: number }>()
   #pinchStart: { dist: number; scale: number; mx: number; my: number } | null = null
+  #mouseDrag: { x: number; y: number; moved: boolean } | null = null
+  #dragStart: { x: number; y: number; t: number } | null = null
+  #dragTranslate: number | null = null
+  #lastWheelAt = 0
+  #wheelAccum = 0
 
   constructor(host: ModeHost) {
     this.#host = host
@@ -64,6 +69,74 @@ export class SingleMode implements ReaderMode {
         this.#trackPointer(type, e as PointerEvent)
       })
     }
+    // 桌面鼠标按住拖动（非放大态拖出阈值→翻页判定，放大态→平移，与触摸一致）
+    this.#cleanup.addListener(this.#stage, 'pointerdown', (e: Event) => {
+      const pe = e as PointerEvent
+      if (pe.pointerType !== 'mouse' || pe.button !== 0) return
+      this.#mouseDrag = { x: pe.clientX, y: pe.clientY, moved: false }
+      this.#dragStart = { x: pe.clientX, y: pe.clientY, t: pe.timeStamp }
+    })
+    this.#cleanup.addListener(this.#stage, 'pointermove', (e: Event) => {
+      const pe = e as PointerEvent
+      if (pe.pointerType !== 'mouse' || !this.#mouseDrag) return
+      const dx = pe.clientX - this.#mouseDrag.x
+      const dy = pe.clientY - this.#mouseDrag.y
+      this.#mouseDrag = { x: pe.clientX, y: pe.clientY, moved: true }
+      if (this.isZoomed()) {
+        this.#pan(dx, dy)
+      } else if (Math.hypot(pe.clientX - (this.#dragStart?.x ?? pe.clientX), pe.clientY - (this.#dragStart?.y ?? pe.clientY)) >= 10) {
+        // 非放大态：视觉跟手（临时 translate），释放时按滑动规则判定翻页
+        this.#dragTranslate = (this.#dragTranslate ?? 0) + dx
+        this.#applyDragTranslate()
+      }
+    })
+    const endMouseDrag = (e: Event) => {
+      const pe = e as PointerEvent
+      if (pe.pointerType !== 'mouse' || !this.#mouseDrag) return
+      this.#mouseDrag = null
+      this.#dragTranslate = null
+      if (this.#dragStart) {
+        const totalDx = pe.clientX - this.#dragStart.x
+        const totalDy = pe.clientY - this.#dragStart.y
+        const dur = Math.max(1, pe.timeStamp - this.#dragStart.t)
+        const velocity = Math.hypot(totalDx, totalDy) / dur
+        this.#dragStart = null
+        if (!this.isZoomed()) {
+          const ax = Math.abs(totalDx)
+          const ay = Math.abs(totalDy)
+          if (ax > ay * 1.5 && (ax >= this.#stage.getBoundingClientRect().width * 0.15 || velocity >= 0.5)) {
+            this.#applyDragTranslate(0)
+            this.#handleSwipe(totalDx < 0 ? 'left' : 'right')
+            return
+          }
+        }
+      }
+      this.#applyDragTranslate(0)
+    }
+    this.#cleanup.addListener(this.#stage, 'pointerup', endMouseDrag)
+    this.#cleanup.addListener(this.#stage, 'pointercancel', endMouseDrag)
+    // 桌面滚轮：整页步进。滚轮一格（离散事件）翻一页；触控板高频流按像素累积折算
+    this.#cleanup.addListener(this.#stage, 'wheel', (e: Event) => {
+      const we = e as WheelEvent
+      if (we.ctrlKey) return
+      if (we.deltaX !== 0 && we.deltaY === 0) {
+        // 触控板横滑：直接翻页（跟滑动同规则）
+        e.preventDefault()
+        this.step(we.deltaX < 0 ? (this.#host.settings.direction === 'rtl' ? -1 : 1) : (this.#host.settings.direction === 'rtl' ? 1 : -1))
+        return
+      }
+      e.preventDefault()
+      const dir = we.deltaY > 0 ? 1 : -1
+      const now = we.timeStamp
+      if (now - this.#lastWheelAt > 80) this.#wheelAccum = 0 // 新的一格
+      this.#lastWheelAt = now
+      this.#wheelAccum += Math.abs(we.deltaY)
+      if (this.#wheelAccum >= 40) {
+        const n = Math.min(3, Math.floor(this.#wheelAccum / 40))
+        this.#wheelAccum -= n * 40
+        for (let i = 0; i < n; i++) this.step(dir)
+      }
+    }, { passive: false })
     this.#cleanup.addListener(this.#stage, 'click', (e) => e.stopPropagation())
     this.#cleanup.addListener(this.#stage, 'contextmenu', (e) => e.stopPropagation())
 
@@ -147,6 +220,11 @@ export class SingleMode implements ReaderMode {
     this.#viewport.style.transform = `translate(${this.#tx}px, ${this.#ty}px) scale(${this.#scale})`
     if (this.#scale <= 1.01) this.#viewport.classList.remove('myr-zoomed')
     else this.#viewport.classList.add('myr-zoomed')
+  }
+
+  /** 鼠标拖动跟手位移（非放大态的临时视觉反馈，释放后归零）。 */
+  #applyDragTranslate(px = this.#dragTranslate ?? 0): void {
+    this.#viewport.style.translate = px !== 0 ? `${px}px` : ''
   }
 
   #handleTap(x: number, y: number): void {

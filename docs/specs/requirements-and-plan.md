@@ -665,3 +665,14 @@ const MEMORY_MODE_CAP_MIB = 100;        // 固定值，不提供设置（§7 D7�
   3. `adapter.ts`：顶层原站阅读器正在显示目标章节时直接抓 DOM（零网络零延迟）。
 - 测试：单测新增 `scrape.test.ts`（4 项：文档序去重、封面过滤、expando 排除、空 src 跳过）；e2e 新增 `resolver-scrape.spec.ts`（捕获 3s 超时后转 DOM 抓取，5 张 + 封面过滤断言）。harness mock 页修一处 expando bug：`img.referrerpolicy = …`（小写）不会成为内容属性，须 `setAttribute('referrerpolicy', …)`，否则选择器匹配不到动态创建的图。
 - v1.1.1（单元 153 + e2e 23 全绿，typecheck/lint 干净）。
+
+### 增量（2026-10-27，桌面端滚轮与鼠标拖动）
+
+- 需求依据：§1.1「次要：桌面 Chromium，保证可用」。桌面反馈三模式都无法用滚轮翻页、无法用鼠标按住拖动（模拟手指滑动）。
+- 根因（Playwright 逐步诊断）：①Chromium 桌面上鼠标拖动不触发原生 pan（那是触摸专属），且页面 `img` 默认 `draggable` 会把拖动变成 drag-and-drop（吞掉 `pointermove`，随后 `pointercancel`）——手动 `scrollBy` 补偿从未收到事件；②横向/单页模式没有滚轮处理，横向滚动容器对垂直滚轮（deltaY）没有对应轴，滚了没反应。
+- 修复：
+  1. `continuous.ts`：`pointerType=mouse` 按住拖动 → `scrollBy(-dx,-dy)`（触摸原生 pan 不受影响）；拖动超 4px 后吞掉 click（不误触发点击区）。图片统一 `img.draggable = false`（`window.ts`）+ CSS `-webkit-user-drag: none` 双保险。
+  2. 横向模式：垂直滚轮转翻行。一格滚轮（离散事件，间隔 >80ms 重置）至少一行；触控板高频流按像素累积折算（40px≈一行），一次最多 3 行。`deltaX`（shift+滚轮/触控板横滑）交给原生横滚。
+  3. `single.ts`：同款滚轮处理（一行=一页）；鼠标拖动非放大态视觉跟手（临时 `translate`），释放按滑动规则（§4.5：水平 ≥15% 视口或 ≥0.5px/ms 且水平主导）判定翻页，方向跟随阅读方向；放大态拖动只平移（与触摸一致）。
+  4. e2e 新增 `desktop-input.spec.ts`（4 项）与 Playwright `desktop-chromium` project（非 isMobile 仿真——Pixel 7 的 `isMobile: true` 会把 `mouse.wheel` 合成为触摸手势，测不到真滚轮；这也是诊断中发现 e2e deltaY 被 OS 换算为 76.19 而非 200 的原因，因此实现按「离散一格」而非固定像素数判定）。
+- v1.2.0（单元 153 + e2e 27 全绿，typecheck/lint 干净）。
